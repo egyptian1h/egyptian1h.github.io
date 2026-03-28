@@ -1,5 +1,5 @@
 ---
-title: "ADCS Attacks Deep Dive: ESC1–ESC11 Complete Exploitation Guide"
+title: "ADCS Attacks Deep Dive: ESC1 to ESC11 Complete Exploitation Guide"
 date: 2026-03-28 13:20:00 +0200
 categories: [Security, Active Directory]
 tags: [adcs, active-directory, red-team, pentest, esc1, esc2, esc3, esc4, esc5, esc6, esc7, esc8, esc9, esc10, esc11, certificates, pki, domain-controller, exploit]
